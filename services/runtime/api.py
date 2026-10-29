@@ -31,6 +31,7 @@ RUNTIME_API_CAPABILITIES = (
     "configured-runtime-diagnostics",
     "recoverable-results",
     "insertion-disabled",
+    "insertion-transactions-v1",
 )
 
 
@@ -155,7 +156,7 @@ def create_app(
 
     @app.get("/runtime/handshake")
     def handshake() -> dict[str, Any]:
-        return {"status": "ok", **identity, "capabilities": ["serialized-sessions-v1", "recoverable-results", "insertion-disabled"]}
+        return {"status": "ok", **identity, "capabilities": ["serialized-sessions-v1", "recoverable-results", "insertion-disabled", "insertion-transactions-v1"]}
 
     @app.get("/status")
     def status() -> dict[str, Any]:
@@ -175,6 +176,14 @@ def create_app(
     @app.post("/runtime/cancel")
     def cancel_runtime(payload: dict[str, Any]) -> dict[str, Any]:
         return controller.command("cancel", payload)
+
+    @app.post("/runtime/commit/reserve")
+    def reserve_commit(payload: dict[str, Any]) -> dict[str, Any]:
+        return controller.reserve_commit(payload)
+
+    @app.post("/runtime/commit/complete")
+    def complete_commit(payload: dict[str, Any]) -> dict[str, Any]:
+        return controller.complete_commit(payload)
 
     @app.post("/runtime/shutdown")
     def shutdown_runtime() -> dict[str, Any]:

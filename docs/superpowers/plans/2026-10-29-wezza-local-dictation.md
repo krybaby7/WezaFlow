@@ -26,7 +26,7 @@ Three approaches were considered:
 
 Do not equate `language=None` with successful code switching. Do not assume English-only Distil-Whisper becomes multilingual because the profile omits a language restriction. Preserve the CPU English path for comparison/recovery, but it cannot pass the user's target gate.
 
-Initial desktop validation targets are Notepad, VS Code/Cursor-style editor controls, Chromium textarea and contenteditable fields, and a chat/email compose field. These are proposed coverage, not claims about the user's regular destination apps. Do not trigger send/submit when inserting. General command editing, meetings, calendar, mobile/macOS parity, and screenshot capture are outside this program's first release.
+The user confirmed their regular destinations: Codex, Claude, and Comet browser, especially browser LLM chats, Google Docs, Google Sheets, and email. Other browsers are occasional. Prioritize those actual composers and editors; Notepad and synthetic textarea/contenteditable fixtures are diagnostic controls, not substitutes for real-app acceptance. Installed Claude desktop was observed, but exact editor capabilities remain unverified. Browser extension support for ordinary web fields does not establish support for desktop apps, Comet's internal assistant, or Docs/Sheets canvas editors. Do not trigger send/submit when inserting. General command editing, meetings, calendar, mobile/macOS parity, and screenshot capture are outside this program's first release.
 
 ## 2. Target contracts
 

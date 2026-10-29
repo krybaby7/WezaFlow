@@ -5,6 +5,8 @@ calls outside the state lock, including cleanup of cancelled noninterruptible wo
 """
 from __future__ import annotations
 
+from dataclasses import asdict
+from services.injection.transaction import CommitRequest, CommitResult, CommitOutcome
 from collections import OrderedDict
 from copy import deepcopy
 from threading import Condition, Thread
@@ -41,6 +43,13 @@ class SerializedSessionController:
         self._error = None
         self._thread = None
         self._active_configuration = None
+        self._capture_id = None
+        self._target_token = None
+        self._commit_busy = False
+        self._transaction = None
+        self._transactions = {}
+        self._session_generation = 0
+        self._result_generation = None
 
     def snapshot(self):
         with self._condition:
@@ -50,13 +59,18 @@ class SerializedSessionController:
         return {'status': 'ok', 'protocol_version': PROTOCOL_VERSION,
                 'engine_id': self.engine_id, 'state': self._state,
                 'session_id': self._session_id, 'binding_id': self._binding_id,
-                'mode': self._mode, 'busy': self._busy, 'last_error': self._error,
+                'mode': self._mode, 'busy': self._busy or self._commit_busy, 'last_error': self._error,
                 'result': deepcopy(self._result), 'result_session_id': self._result_session_id,
+                'capture_id': self._capture_id,
+                'session_generation': self._session_generation,
+                'result_generation': self._result_generation,
+                'insertion_transaction': deepcopy(self._transaction),
                 'automatic_insertion': False, 'active_configuration': deepcopy(self._active_configuration)}
 
     def command(self, action: str, payload: dict):
         # Validate the wire envelope before taking ownership of any resource.
         try:
+            if not isinstance(payload, dict): raise ValueError('invalid_command')
             if payload.get('engine_id') != self.engine_id or (type(payload.get('protocol_version')) is not int or payload.get('protocol_version') != PROTOCOL_VERSION):
                 raise ValueError('engine_mismatch')
             sid = str(UUID(str(payload['session_id'])))
@@ -72,9 +86,16 @@ class SerializedSessionController:
                 raise ValueError('invalid_language')
             if action not in {'start', 'stop', 'cancel'}:
                 raise ValueError('invalid_action')
+            capture_id = payload.get('capture_id')
+            target_token = payload.get('target_token')
+            if capture_id is not None:
+                if not isinstance(capture_id, str): raise ValueError('invalid_capture_id')
+                capture_id = str(UUID(capture_id))
+            if target_token is not None and (not isinstance(target_token, str) or not target_token or len(target_token) > 4096):
+                raise ValueError('invalid_target_token')
         except (KeyError, TypeError, ValueError) as exc:
             return {**self.snapshot(), 'accepted': False, 'reason': str(exc)}
-        fingerprint = (action, sid, binding, mode, language)
+        fingerprint = (action, sid, binding, mode, language, capture_id, target_token)
         with self._condition:
             def reply(accepted, reason=None):
                 return {**self._snapshot(), 'accepted': accepted, 'reason': reason,
@@ -93,13 +114,19 @@ class SerializedSessionController:
             elif action == 'start':
                 if mode != 'dictation':
                     reason = 'command_editing_unavailable_until_M2'
-                elif self._busy:
+                elif self._busy or self._commit_busy:
                     reason = 'busy'
                 elif sid == self._session_id:
                     reason = 'stale_session'
+                elif capture_id is not None and capture_id == self._capture_id:
+                    reason = 'capture_reused'
                 else:
                     # Settings I/O/factory work belongs to worker, never this lock.
                     self._session_id, self._binding_id = sid, binding
+                    self._capture_id, self._target_token = capture_id, target_token
+                    self._session_generation += 1
+                    self._transactions.clear()
+                    self._transaction = None
                     self._mode = mode
                     self._language = None if language is None or language.strip().lower() in ('', 'auto', 'none') else language.strip()
                     self._state, self._error = 'starting', None
@@ -119,7 +146,9 @@ class SerializedSessionController:
                 reason = 'stale_session'
             elif action == 'stop' and binding != self._binding_id:
                 reason = 'binding_mismatch'
-            elif not self._busy:
+            elif self._commit_busy:
+                reason = 'too_late'
+            elif not self._busy and (self._state != 'ready' or action != 'cancel'):
                 reason = 'not_active'
             elif action == 'cancel':
                 self._cancelled = True
@@ -134,6 +163,64 @@ class SerializedSessionController:
             if len(self._recent) > 128:
                 self._recent.popitem(last=False)
             return reply(reason is None, reason)
+
+    def reserve_commit(self, payload):
+        try:
+            request = CommitRequest.parse(payload, self.engine_id)
+        except ValueError as exc:
+            return {**self.snapshot(), 'accepted': False, 'reason': str(exc),
+                    'reservation_decision': 'rejected', 'write_authorized': False}
+        with self._condition:
+            def reply(ok, reason=None, decision='rejected'):
+                return {**self._snapshot(), 'accepted': ok, 'reason': reason,
+                        'reservation_decision': decision, 'write_authorized': decision == 'reserved'}
+            if request.session_generation != self._session_generation:
+                return reply(False, 'stale_generation')
+            if request.session_id != self._session_id:
+                return reply(False, 'stale_session')
+            previous = self._transactions.get(request.transaction_id)
+            if previous:
+                if previous[0] != request:
+                    return reply(False, 'transaction_conflict')
+                return reply(True, decision='replayed_inflight' if previous[1] is None else 'replayed_completed')
+            if self._closed:
+                return reply(False, 'shutdown')
+            if self._busy or self._commit_busy or self._state != 'ready' or self._cancelled:
+                return reply(False, 'not_ready')
+            if request.capture_id != self._capture_id or request.result_session_id != self._result_session_id or self._result_session_id != self._session_id or self._result_generation != self._session_generation:
+                return reply(False, 'provenance_mismatch')
+            if self._transaction is not None:
+                return reply(False, 'generation_consumed')
+            self._transactions[request.transaction_id] = (request, None)
+            self._transaction = {**asdict(request), 'outcome': None}
+            self._commit_busy = True
+            self._state = 'committing'
+            return reply(True, decision='reserved')
+
+    def complete_commit(self, payload):
+        try:
+            result = CommitResult.parse(payload, self.engine_id)
+        except ValueError as exc:
+            return {**self.snapshot(), 'accepted': False, 'reason': str(exc)}
+        with self._condition:
+            def reply(ok, reason=None):
+                return {**self._snapshot(), 'accepted': ok, 'reason': reason}
+            request = result.request
+            if request.session_generation != self._session_generation:
+                return reply(False, 'stale_generation')
+            if request.session_id != self._session_id:
+                return reply(False, 'stale_session')
+            previous = self._transactions.get(request.transaction_id)
+            if previous is None or previous[0] != request:
+                return reply(False, 'transaction_mismatch')
+            if previous[1] is not None:
+                return reply(previous[1] == result.outcome, None if previous[1] == result.outcome else 'completion_conflict')
+            self._transactions[request.transaction_id] = (request, result.outcome)
+            self._transaction['outcome'] = result.outcome.value
+            self._commit_busy = False  # Completion asserts the external writer has returned/reaped.
+            self._state = ('ready' if result.outcome == CommitOutcome.NOT_ATTEMPTED_RECOVERABLE else result.outcome.value)
+            self._condition.notify_all()
+            return reply(True)
 
     def settings_snapshot(self):
         with self._condition:
@@ -175,6 +262,7 @@ class SerializedSessionController:
                 else:
                     self._result = result.to_dict() if hasattr(result, 'to_dict') else deepcopy(result)
                     self._result_session_id = self._session_id
+                    self._result_generation = self._session_generation
                     self._state = 'ready'
         except Exception:
             with self._condition:

@@ -58,3 +58,17 @@ Sol spec/quality review identified profile-selection and transport-recovery defe
 Still unverified: real microphone/hotkey/Escape timing, device faults, real Windows audio restoration, native shell startup/exit fault trials, and UI behavior in an actual desktop build. The HTTP smoke used a temporary configuration root and an ephemeral loopback port, and never issued a valid recording start. No real speech, model inference, clipboard write, or insertion was performed. The existing release executable was not rebuilt or launched.
 
 Next: target-bound insertion and capture provenance (M2), then cached-model readiness/live evaluation adapters and constrained language editing (M3/M4). Personal speech is still required before selecting models or claiming accuracy. Cache directory inventory found multilingual faster-whisper large-v3-turbo and local GGUF candidates, but completeness, loadability and quality remain unverified. Model retention/warm latency and power measurements remain part of M3; the current per-session adapter construction is not a qualified latency policy.
+
+## 29 October 2026 — M2 transaction core
+
+Implemented the Python reservation/completion contract for a future native insertion broker. Automatic insertion remains disabled: no OS writer, target capture, clipboard operation, or desktop adapter is integrated in this slice.
+
+- A server-issued session generation binds result, capture and transaction identity. Reusing an old session UUID cannot revive earlier write permission.
+- Reservation and cancellation share the controller lock. Only the first successful reservation returns `write_authorized=true`; concurrent and historical replays never authorize another write.
+- Reservation waits for the processing worker to relinquish ownership, including the interval after result publication but before cleanup finishes. Pending commits block new sessions and report cancellation as too late.
+- Completion must mean the external writer has returned or been reaped. An uncertain delivery consumes the transaction without retrying it. Missing completion retains ownership; a mere timeout does not release a potentially live writer. The future broker must enforce this assertion.
+- The transaction ledger is bounded to the current server generation. The latest result stays available for explicit recovery.
+
+Independent Sol review passed 46 transaction/controller/API tests. The parent inspected the integrated diff and ran the complete Python suite: **284 passed, zero skips**. Coverage includes concurrent duplicate reservations, cancel/reserve races, all completion outcomes, old-generation replay, the worker-cleanup barrier and HTTP success/replay paths. The user's two pre-existing files retain their original hashes. No frontend or Rust changes were made in this slice.
+
+The user identified **Codex, Claude and Comet browser** as primary targets, including browser LLM chats, Docs, Sheets and email. These now drive the real-app matrix. Read-only feasibility work recommends editor-bound browser transactions for qualified ordinary fields and a bounded TSF investigation for desktop composers. Neither path has been implemented or qualified; generic contenteditable tests cannot establish Docs/Sheets or desktop support. The actual insertion gate and manual app trials remain outstanding.
