@@ -2,6 +2,24 @@
 mod tests {
     use super::*;
     #[test]
+    fn automatic_capture_finish_releases_without_extra_stop() {
+        let mut c = SessionControl::default();
+        c.press("key:1", "dictation", "first");
+        let done = serde_json::json!({"session_id":"first","state":"ready","busy":false});
+        assert!(c.observe("first", &done).unwrap().finished);
+        assert!(c.release("key:1").is_none());
+    }
+    #[test]
+    fn capture_warning_is_current_and_error_takes_priority() {
+        let mut reply = serde_json::json!({"session_id":"one","state":"ready","capture":{"terminal_code":"duration_limit"}});
+        assert_eq!(runtime_message("one", &reply), Some("Five-minute limit reached."));
+        assert_eq!(runtime_message("old", &reply), None);
+        reply["state"] = serde_json::json!("cancelled");
+        assert_eq!(runtime_message("one", &reply), None);
+        reply["last_error"] = serde_json::json!("Microphone failed");
+        assert_eq!(runtime_message("one", &reply), Some("Microphone failed"));
+    }
+    #[test]
     fn release_is_retained_and_only_initiating_binding_owns_it() {
         let mut c = SessionControl::default();
         let start = c.press("keyboard:1", "dictation", "session").unwrap();
@@ -502,4 +520,18 @@ impl SessionControl {
             ..Default::default()
         }
     }
+}
+
+/// Selects only a warning belonging to the capture being observed.
+pub(super) fn runtime_message<'a>(id: &str, reply: &'a serde_json::Value) -> Option<&'a str> {
+    if let Some(error) = reply["last_error"].as_str() {
+        return Some(error);
+    }
+    if reply["session_id"].as_str() == Some(id)
+        && matches!(reply["state"].as_str(), Some("draining" | "processing" | "ready" | "no_speech"))
+        && reply["capture"]["terminal_code"].as_str() == Some("duration_limit")
+    {
+        return Some("Five-minute limit reached.");
+    }
+    None
 }

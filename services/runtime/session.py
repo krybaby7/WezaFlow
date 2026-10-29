@@ -290,27 +290,16 @@ def normalize_audio_for_pipeline(audio: Any) -> Any:
 
 def wav_bytes_to_float_samples(wav_bytes: bytes) -> list[float]:
     with wave.open(io.BytesIO(wav_bytes), "rb") as wav:
-        channels = wav.getnchannels()
-        sample_width = wav.getsampwidth()
-        frames = wav.readframes(wav.getnframes())
+        if (wav.getnchannels() != 1 or wav.getframerate() != 16000
+                or wav.getsampwidth() != 2 or wav.getcomptype() != 'NONE'):
+            raise RuntimeError("Expected mono 16 kHz 16-bit PCM WAV audio")
+        expected = wav.getnframes() * 2
+        frames = wav.readframes(wav.getnframes() + 1)
+    if len(frames) != expected or len(frames) % 2:
+        raise RuntimeError("Incomplete PCM WAV frames")
+    return [int.from_bytes(frames[offset:offset+2], 'little', signed=True) / 32768.0
+            for offset in range(0, len(frames), 2)]
 
-    if sample_width != 2:
-        raise RuntimeError("Only 16-bit PCM WAV audio is supported by the runtime pipeline")
-
-    samples: list[float] = []
-    frame_width = sample_width * channels
-    for offset in range(0, len(frames), frame_width):
-        channel_total = 0
-        for channel in range(channels):
-            sample_offset = offset + channel * sample_width
-            value = int.from_bytes(
-                frames[sample_offset : sample_offset + sample_width],
-                "little",
-                signed=True,
-            )
-            channel_total += value
-        samples.append((channel_total / channels) / 32768.0)
-    return samples
 
 
 def audio_stats(audio: Any) -> dict[str, int | float]:

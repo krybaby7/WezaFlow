@@ -413,7 +413,7 @@ class AudioRecorderFailureTests(unittest.TestCase):
         self.assertEqual(recorder.snapshot_samples(), [])
         recorder.start()
         callbacks[0]([[0.8]])
-        self.assertEqual(recorder.snapshot_samples(), [0.1])
+        self.assertAlmostEqual(recorder.snapshot_samples()[0], 0.1, places=6)
         recorder.stop()
 
 
@@ -455,18 +455,26 @@ class AudioRecorderFailureTests(unittest.TestCase):
                         recorder.stop()
                     self.assertIs(raised.exception, failure)
                     self.assertFalse(recorder.is_recording)
-                    self.assertIsNone(recorder._stream)
-                    self.assertEqual(recorder.snapshot_samples(), [])
                     if streams:
-                        self.assertEqual(streams[0].closed, 1)
-                    recorder.stop()
+                        self.assertIs(recorder._stream, streams[0])
+                        self.assertTrue(recorder.capture_status.cleanup_pending)
+                        with self.assertRaises(RuntimeError): recorder.start()
+                    else:
+                        self.assertIsNone(recorder._stream)
+                    self.assertEqual(recorder.snapshot_samples(), [])
                     if streams:
                         self.assertEqual(streams[0].closed, 1)
                     old_callback = callbacks[0]
                     failing[0] = False
+                    recorder.stop()
+                    self.assertFalse(recorder.capture_status.cleanup_pending)
+                    if streams:
+                        self.assertEqual(streams[0].closed, 2)
                     recorder.start()
                     old_callback([[0.8]])
-                    self.assertEqual(recorder.snapshot_samples(), [0.1, 0.25])
+                    self.assertEqual(len(recorder.snapshot_samples()), 2)
+                    self.assertAlmostEqual(recorder.snapshot_samples()[0], 0.1, places=6)
+                    self.assertEqual(recorder.snapshot_samples()[1], 0.25)
                     data = recorder.stop()
                     with wave.open(io.BytesIO(data), 'rb') as wav:
                         self.assertEqual(wav.getnframes(), 3)

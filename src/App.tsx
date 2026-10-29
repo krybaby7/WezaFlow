@@ -690,6 +690,7 @@ function StatusPanel({
         <p>Automatic insertion and command editing are unavailable during the safety rebuild.</p>
         {status?.result && <section aria-label="Result recovery">
           <h3>{status.result_session_id === status.session_id ? "Session result" : "Previous session result"}</h3>
+          {status.result.diagnostics?.capture?.terminal_code === "duration_limit" && <p role="alert">This saved result contains only the first five minutes of its recording.</p>}
           <textarea aria-label="Recoverable dictation" readOnly value={status.result.polished_text} />
           <details><summary>Raw transcript</summary><p>{status.result.raw_transcript}</p></details>
           <button type="button" onClick={() => void copyResult()}>Copy result</button>

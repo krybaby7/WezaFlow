@@ -50,6 +50,8 @@ class SerializedSessionController:
         self._transactions = {}
         self._session_generation = 0
         self._result_generation = None
+        self._capture = None
+        self._pending_recorder = None
 
     def snapshot(self):
         with self._condition:
@@ -59,9 +61,9 @@ class SerializedSessionController:
         return {'status': 'ok', 'protocol_version': PROTOCOL_VERSION,
                 'engine_id': self.engine_id, 'state': self._state,
                 'session_id': self._session_id, 'binding_id': self._binding_id,
-                'mode': self._mode, 'busy': self._busy or self._commit_busy, 'last_error': self._error,
+                'mode': self._mode, 'busy': self._busy or self._commit_busy or self._pending_recorder is not None, 'last_error': self._error,
                 'result': deepcopy(self._result), 'result_session_id': self._result_session_id,
-                'capture_id': self._capture_id,
+                'capture_id': self._capture_id, 'capture': deepcopy(self._capture),
                 'session_generation': self._session_generation,
                 'result_generation': self._result_generation,
                 'insertion_transaction': deepcopy(self._transaction),
@@ -114,7 +116,7 @@ class SerializedSessionController:
             elif action == 'start':
                 if mode != 'dictation':
                     reason = 'command_editing_unavailable_until_M2'
-                elif self._busy or self._commit_busy:
+                elif self._busy or self._commit_busy or self._pending_recorder is not None:
                     reason = 'busy'
                 elif sid == self._session_id:
                     reason = 'stale_session'
@@ -130,6 +132,7 @@ class SerializedSessionController:
                     self._mode = mode
                     self._language = None if language is None or language.strip().lower() in ('', 'auto', 'none') else language.strip()
                     self._state, self._error = 'starting', None
+                    self._capture = None
                     self._cancelled = self._stop = False
                     self._busy = True
                     snapshot = freeze_settings(deepcopy(self._settings))
@@ -159,6 +162,7 @@ class SerializedSessionController:
             elif action == 'cancel':
                 self._cancelled = True
                 self._state = 'cancelled'
+                self._capture = None
                 self._condition.notify_all()
             else:
                 self._stop = True
@@ -248,14 +252,23 @@ class SerializedSessionController:
             with self._condition:
                 if self._cancelled: return
             recorder.start()
-            with self._condition:
-                if not self._cancelled:
-                    self._state = 'draining' if self._stop else 'recording'
-                while not self._stop and not self._cancelled:
-                    self._condition.wait()
-                if not self._cancelled: self._state = 'draining'
+            while True:
+                capture = self._read_capture(recorder, poll=True)
+                with self._condition:
+                    if not self._cancelled:
+                        self._capture = capture
+                        self._state = 'draining' if self._stop else 'recording'
+                    if self._stop or self._cancelled or (capture and capture['terminal_code']):
+                        if not self._cancelled: self._state = 'draining'
+                        break
+                    self._condition.wait(timeout=0.05)
             stopped = True
             audio = recorder.stop()
+            capture = self._read_capture(recorder)
+            with self._condition:
+                if not self._cancelled: self._capture = capture
+                if capture and capture['terminal_code'] not in (None, 'duration_limit'):
+                    raise CaptureFailure()
             with self._condition:
                 if self._cancelled: return
                 self._state = 'processing'
@@ -267,35 +280,74 @@ class SerializedSessionController:
                     self._state = 'no_speech'
                 else:
                     self._result = result.to_dict() if hasattr(result, 'to_dict') else deepcopy(result)
+                    if capture is not None:
+                        self._result.setdefault('diagnostics', {})['capture'] = capture
                     self._result_session_id = self._session_id
                     self._result_generation = self._session_generation
                     self._state = 'ready'
-        except Exception:
+        except Exception as exc:
             with self._condition:
                 if not self._cancelled:
                     self._state = 'error'
                     # Adapter messages can contain transcript/context; do not expose them.
-                    self._error = 'Session adapter failed; check local model and audio configuration.'
+                    self._error = ('Microphone capture failed. Check the input device and try again.' if isinstance(exc, CaptureFailure) else 'Session adapter failed; check local model and audio configuration.')
         finally:
             if recorder is not None and not stopped:
                 try:
                     recorder.stop()
                 except Exception:
                     pass
+            capture = self._read_capture(recorder) if recorder is not None else None
             with self._condition:
+                if capture and capture['cleanup_pending']:
+                    self._pending_recorder = recorder
+                    self._error = 'Microphone cleanup failed. Restart Wezza before recording again.'
+                if not self._cancelled: self._capture = capture
                 self._busy = False
                 self._condition.notify_all()
 
     def wait_for_worker(self, timeout=None):
         """Bounded join for shutdown and deterministic adapter tests."""
         with self._condition:
-            return self._condition.wait_for(lambda: not self._busy, timeout)
+            return self._condition.wait_for(lambda: not self._busy and self._pending_recorder is None, timeout)
+
+    @staticmethod
+    def _read_capture(recorder, poll=False):
+        if poll and hasattr(recorder, 'poll_capture_status'):
+            status = recorder.poll_capture_status()
+        else:
+            status = getattr(recorder, 'capture_status', None)
+        return asdict(status) if status is not None else None
 
     def close(self):
         with self._condition:
             self._closed = self._cancelled = True
             if self._busy: self._state = 'cancelled'
+            self._capture = None
+            if not self._busy and self._pending_recorder is not None:
+                self._busy = True
+                self._thread = Thread(target=self._retry_cleanup, name='wezza-capture-cleanup', daemon=True)
+                self._thread.start()
             self._condition.notify_all()
+
+    def _retry_cleanup(self):
+        recorder = self._pending_recorder
+        try:
+            recorder.stop()
+        except Exception:
+            pass
+        finally:
+            capture = self._read_capture(recorder)
+            with self._condition:
+                if not capture or not capture['cleanup_pending']:
+                    self._pending_recorder = None
+                self._busy = False
+                self._condition.notify_all()
+
+
+class CaptureFailure(RuntimeError):
+    pass
+
 
 
 def freeze_settings(value):

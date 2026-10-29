@@ -1,6 +1,16 @@
 export type Fetcher = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
+export type CaptureStatus = {
+  terminal_code: string | null;
+  sample_count?: number;
+  max_samples?: number;
+  requested_sample_rate?: number;
+  actual_sample_rate?: number | null;
+  cleanup_pending?: boolean;
+};
+
 export type RuntimeStatus = {
+  capture?: CaptureStatus | null;
   asr_worker?: {
     state: string;
     busy: boolean;
@@ -18,7 +28,7 @@ export type RuntimeStatus = {
   session_id?: string | null;
   result_session_id?: string | null;
   busy?: boolean;
-  result?: {raw_transcript: string; polished_text: string} | null;
+  result?: {raw_transcript: string; polished_text: string; diagnostics?: {capture?: CaptureStatus}} | null;
 };
 
 export type DependencyStatus = {

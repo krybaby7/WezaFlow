@@ -1076,7 +1076,7 @@ fn settle_runtime_reply(
         } else if ack.state != "starting" {
             restore_system_audio(app);
         }
-        show_recording_bar(app, &ack.state, &ack.mode, reply["last_error"].as_str());
+        show_recording_bar(app, &ack.state, &ack.mode, session::runtime_message(id, reply));
         if matches!(
             ack.state.as_str(),
             "ready" | "no_speech" | "cancelled" | "error"

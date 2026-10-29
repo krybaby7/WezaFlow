@@ -128,6 +128,26 @@ describe("App", () => {
     expect(warmRuntime).not.toHaveBeenCalled();
   });
 
+  it("shows the capture limit warning on the originating result", async () => {
+    const client = fakeClient({getStatus: vi.fn(async () => ({status:"ok",state:"ready",mode:"dictation",profile:"low-impact",quiet_mode:false,quality_fallback:false,last_error:null,session_id:"one",result_session_id:"one",result:{raw_transcript:"hello",polished_text:"Hello.",diagnostics:{capture:{terminal_code:"duration_limit"}}}}))});
+    render(<App client={client} />);
+    expect(await screen.findByText("This saved result contains only the first five minutes of its recording.")).toBeInTheDocument();
+  });
+
+  it.each(["starting", "recording", "error", "no_speech", "cancelled"])("qualifies the retained earlier result in %s", async (state) => {
+    const client = fakeClient({getStatus: vi.fn(async () => ({status:"ok",state,mode:"dictation",profile:"low-impact",quiet_mode:false,quality_fallback:false,last_error:null,session_id:"new",result_session_id:"old",result:{raw_transcript:"hello",polished_text:"Hello.",diagnostics:{capture:{terminal_code:"duration_limit"}}}}))});
+    render(<App client={client} />);
+    await screen.findByLabelText("Recoverable dictation");
+    expect(screen.getByText("This saved result contains only the first five minutes of its recording.")).toBeInTheDocument();
+  });
+
+  it("does not qualify a new unlimited result using the earlier capture status", async () => {
+    const client = fakeClient({getStatus: vi.fn(async () => ({status:"ok",state:"ready",mode:"dictation",profile:"low-impact",quiet_mode:false,quality_fallback:false,last_error:null,session_id:"new",result_session_id:"new",capture:{terminal_code:"duration_limit"},result:{raw_transcript:"new",polished_text:"New result."}}))});
+    render(<App client={client} />);
+    expect(await screen.findByLabelText("Recoverable dictation")).toHaveValue("New result.");
+    expect(screen.queryByText("This saved result contains only the first five minutes of its recording.")).not.toBeInTheDocument();
+  });
+
   it("offers explicit recovery copy and identifies a retained earlier result", async () => {
     const writeText = vi.fn(async () => undefined);
     Object.defineProperty(navigator, "clipboard", {configurable: true, value: {writeText}});
