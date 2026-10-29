@@ -431,6 +431,46 @@ class AsrBenchmarkTests(unittest.TestCase):
         self.assertIn("-ExecutionPolicy Bypass", content)
         self.assertIn("benchmark_asr.ps1", content)
 
+class WavInputContractTests(unittest.TestCase):
+    def _wav(self, rate=16000, channels=1, payload=b'\x00\x00\x00\x40', width=2):
+        import io
+        import wave
+        buffer = io.BytesIO()
+        with wave.open(buffer, 'wb') as wav:
+            wav.setnchannels(channels)
+            wav.setsampwidth(width)
+            wav.setframerate(rate)
+            wav.writeframes(payload)
+        return buffer.getvalue()
+
+    def _load(self, data):
+        from services.asr.benchmark import load_wav_samples
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'audio.wav'
+            path.write_bytes(data)
+            return load_wav_samples(path)
+
+    def test_accepts_only_16khz_mono_pcm16(self):
+        self.assertEqual(self._load(self._wav()), ([0.0, 0.5], 2 / 16000))
+        for rate in (8000, 44100, 48000):
+            with self.subTest(rate=rate), self.assertRaisesRegex(RuntimeError, '16000|16 kHz'):
+                self._load(self._wav(rate=rate))
+        with self.assertRaisesRegex(RuntimeError, 'mono'):
+            self._load(self._wav(channels=2))
+        with self.assertRaisesRegex(RuntimeError, '16-bit'):
+            self._load(self._wav(width=1))
+
+    def test_rejects_truncated_and_partial_frames_and_invalid_headers(self):
+        for data in (self._wav()[:-2], self._wav(payload=b'\x01\x02\x03'), b'not a wav'):
+            with self.subTest(data=data), self.assertRaisesRegex(RuntimeError, 'WAV|frames'):
+                self._load(data)
+
+    def test_arabic_mismatch_is_not_perfect_score(self):
+        from services.asr.benchmark import score_transcription
+        score = score_transcription('مرحبا بالعالم', 'كلام مختلف')
+        self.assertEqual(score.word_error_rate, 1.0)
+        self.assertEqual(score.word_accuracy, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

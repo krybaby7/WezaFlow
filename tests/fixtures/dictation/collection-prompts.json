@@ -1,0 +1,441 @@
+{
+  "schema_version": 1,
+  "notice": "Prompts only. Never use prompts as ground truth; transcribe actual recorded speech and manually check final references.",
+  "samples": [
+    {
+      "id": "en-01",
+      "prompt": "Book twelve, no, thirteen seats for Friday.",
+      "language_tags": [
+        "EN"
+      ],
+      "metadata": {
+        "dialect": "personal",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "EN",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "en-02",
+      "prompt": "Send the invoice for 1,250 pounds to Mariam.",
+      "language_tags": [
+        "EN"
+      ],
+      "metadata": {
+        "dialect": "personal",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "EN",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "en-03",
+      "prompt": "The project name is WEZZA and the folder is Sprint 4.",
+      "language_tags": [
+        "EN"
+      ],
+      "metadata": {
+        "dialect": "personal",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "EN",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "en-04",
+      "prompt": "Remind me at 8:30 tomorrow morning.",
+      "language_tags": [
+        "EN"
+      ],
+      "metadata": {
+        "dialect": "personal",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "EN",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "en-05",
+      "prompt": "Write a short note about the meeting in Cairo.",
+      "language_tags": [
+        "EN"
+      ],
+      "metadata": {
+        "dialect": "personal",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "EN",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "en-06",
+      "prompt": "Please tell Ahmed: ana gay baad el meeting.",
+      "language_tags": [
+        "EN",
+        "mixed"
+      ],
+      "metadata": {
+        "dialect": "Egyptian Arabic",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "EN",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "en-07",
+      "prompt": "The client said bonjour, then asked for the latest draft.",
+      "language_tags": [
+        "EN",
+        "mixed"
+      ],
+      "metadata": {
+        "dialect": "Egyptian Arabic",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "EN",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "en-08",
+      "prompt": "Change the deadline from Tuesday to Thursday, actually Wednesday.",
+      "language_tags": [
+        "EN",
+        "mixed"
+      ],
+      "metadata": {
+        "dialect": "Egyptian Arabic",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "EN",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "en-09",
+      "prompt": "Please summarize the budget, les risques, and el khatwa el gaya.",
+      "language_tags": [
+        "EN",
+        "mixed"
+      ],
+      "metadata": {
+        "dialect": "Egyptian Arabic",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "EN",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "en-10",
+      "prompt": "My order number is AB-2047 and I need two copies.",
+      "language_tags": [
+        "EN",
+        "mixed"
+      ],
+      "metadata": {
+        "dialect": "Egyptian Arabic",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "EN",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "fr-01",
+      "prompt": "Réserve douze, non, treize places pour vendredi.",
+      "language_tags": [
+        "FR"
+      ],
+      "metadata": {
+        "dialect": "personal",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "FR",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "fr-02",
+      "prompt": "Envoie la facture de 1 250 livres à Mariam.",
+      "language_tags": [
+        "FR"
+      ],
+      "metadata": {
+        "dialect": "personal",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "FR",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "fr-03",
+      "prompt": "Le projet s’appelle WEZZA et le dossier Sprint 4.",
+      "language_tags": [
+        "FR"
+      ],
+      "metadata": {
+        "dialect": "personal",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "FR",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "fr-04",
+      "prompt": "Rappelle-moi demain à huit heures trente.",
+      "language_tags": [
+        "FR"
+      ],
+      "metadata": {
+        "dialect": "personal",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "FR",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "fr-05",
+      "prompt": "Écris une petite note sur notre réunion au Caire.",
+      "language_tags": [
+        "FR"
+      ],
+      "metadata": {
+        "dialect": "personal",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "FR",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "fr-06",
+      "prompt": "Dis à Ahmed : ana gay après le meeting.",
+      "language_tags": [
+        "FR",
+        "mixed"
+      ],
+      "metadata": {
+        "dialect": "Egyptian Arabic",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "FR",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "fr-07",
+      "prompt": "Le client demande the latest draft avant midi.",
+      "language_tags": [
+        "FR",
+        "mixed"
+      ],
+      "metadata": {
+        "dialect": "Egyptian Arabic",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "FR",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "fr-08",
+      "prompt": "Déplace la date de mardi à jeudi, enfin mercredi.",
+      "language_tags": [
+        "FR",
+        "mixed"
+      ],
+      "metadata": {
+        "dialect": "Egyptian Arabic",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "FR",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "fr-09",
+      "prompt": "Résume le budget, the risks, et el khatwa el gaya.",
+      "language_tags": [
+        "FR",
+        "mixed"
+      ],
+      "metadata": {
+        "dialect": "Egyptian Arabic",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "FR",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "fr-10",
+      "prompt": "Mon numéro de commande est AB-2047, il me faut deux copies.",
+      "language_tags": [
+        "FR",
+        "mixed"
+      ],
+      "metadata": {
+        "dialect": "Egyptian Arabic",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "FR",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "ar-01",
+      "prompt": "احجز اتناشر، لأ تلتاشر كرسي ليوم الجمعة.",
+      "language_tags": [
+        "AR"
+      ],
+      "metadata": {
+        "dialect": "Egyptian Arabic",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "AR",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "ar-02",
+      "prompt": "ابعت الفاتورة بتاعة ألف ومتين وخمسين جنيه لمريم.",
+      "language_tags": [
+        "AR"
+      ],
+      "metadata": {
+        "dialect": "Egyptian Arabic",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "AR",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "ar-03",
+      "prompt": "اسم المشروع WEZZA والفولدر Sprint 4.",
+      "language_tags": [
+        "AR"
+      ],
+      "metadata": {
+        "dialect": "Egyptian Arabic",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "AR",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "ar-04",
+      "prompt": "فكرني بكرة الساعة تمانية ونص الصبح.",
+      "language_tags": [
+        "AR"
+      ],
+      "metadata": {
+        "dialect": "Egyptian Arabic",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "AR",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "ar-05",
+      "prompt": "اكتب ملاحظة صغيرة عن اجتماع القاهرة.",
+      "language_tags": [
+        "AR"
+      ],
+      "metadata": {
+        "dialect": "Egyptian Arabic",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "AR",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "ar-06",
+      "prompt": "قول لأحمد إني جاي بعد الـ meeting.",
+      "language_tags": [
+        "AR",
+        "mixed"
+      ],
+      "metadata": {
+        "dialect": "Egyptian Arabic",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "AR",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "ar-07",
+      "prompt": "العميل قال bonjour وبعدين طلب latest draft.",
+      "language_tags": [
+        "AR",
+        "mixed"
+      ],
+      "metadata": {
+        "dialect": "Egyptian Arabic",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "AR",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "ar-08",
+      "prompt": "غير المعاد من التلات للخميس، قصدي الأربع.",
+      "language_tags": [
+        "AR",
+        "mixed"
+      ],
+      "metadata": {
+        "dialect": "Egyptian Arabic",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "AR",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "ar-09",
+      "prompt": "لخص الـ budget و les risques والخطوة الجاية.",
+      "language_tags": [
+        "AR",
+        "mixed"
+      ],
+      "metadata": {
+        "dialect": "Egyptian Arabic",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "AR",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    },
+    {
+      "id": "ar-10",
+      "prompt": "رقم الأوردر AB-2047 وأنا محتاج نسختين.",
+      "language_tags": [
+        "AR",
+        "mixed"
+      ],
+      "metadata": {
+        "dialect": "Egyptian Arabic",
+        "script": "sentence-start policy; manually verify",
+        "prompt_language": "AR",
+        "script_policy": "sentence-anchor-v1",
+        "arabizi_numbers": true
+      }
+    }
+  ]
+}

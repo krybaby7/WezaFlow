@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "description": "Schema example only. No recorded speech is included. Replace the audio path and SHA256 with consented local audio before running.",
+  "samples": [
+    {
+      "id": "example-dev-001",
+      "split": "development",
+      "audio": {"path": "recordings/replace-with-real-audio.wav", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
+      "verbatim": "Send euh non envoie AB-12 بكرة",
+      "acceptable_final_texts": ["Envoie AB-12 bukra.", "Envoie AB-12 bokra."],
+      "language_tags": ["EN", "FR", "AR", "mixed"],
+      "spans": [{"start": 0, "end": 4, "language": "EN"}],
+      "protected_literals": [{"text": "AB-12", "category": "code"}],
+      "metadata": {"dialect": "Egyptian Arabic", "script": "Latin only; sentence begins in English", "script_policy": "sentence-anchor-v1", "arabizi_numbers": true}
+    }
+  ]
+}

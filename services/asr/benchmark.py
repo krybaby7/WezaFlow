@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import shutil
 import subprocess
 import threading
@@ -14,12 +13,13 @@ from typing import Any, Callable
 
 from services.asr.transcriber import Transcriber
 from services.config.settings import load_default_settings
+from services.evaluation.scoring import transcript_words
+from services.evaluation.scoring import score_transcription as _score_transcription
 
 
 Clock = Callable[[], float]
 TranscriberFactory = Callable[["AsrBenchmarkConfig"], Any]
 ResourceMonitorFactory = Callable[[], Any]
-_WORD_PATTERN = re.compile(r"[a-z0-9]+")
 
 
 @dataclass(frozen=True)
@@ -140,35 +140,15 @@ def _parse_metric_value(value: str) -> float | None:
         return None
 
 
-def transcript_words(text: str) -> list[str]:
-    return _WORD_PATTERN.findall(text.lower().replace("_", " "))
-
-
-def _word_edit_distance(expected_words: list[str], actual_words: list[str]) -> int:
-    previous = list(range(len(actual_words) + 1))
-    for expected_index, expected_word in enumerate(expected_words, start=1):
-        current = [expected_index]
-        for actual_index, actual_word in enumerate(actual_words, start=1):
-            cost = 0 if expected_word == actual_word else 1
-            current.append(
-                min(
-                    previous[actual_index] + 1,
-                    current[actual_index - 1] + 1,
-                    previous[actual_index - 1] + cost,
-                )
-            )
-        previous = current
-    return previous[-1]
-
-
 def score_transcription(expected_text: str, actual_text: str) -> TranscriptScore:
-    expected_words = transcript_words(expected_text)
-    actual_words = transcript_words(actual_text)
-    if not expected_words:
-        word_error_rate = 0.0 if not actual_words else 1.0
-    else:
-        word_error_rate = _word_edit_distance(expected_words, actual_words) / len(expected_words)
-    word_error_rate = round(word_error_rate, 3)
+    """Keep the legacy rounded, bounded benchmark view of Unicode scoring.
+
+    The evaluation scorer retains undefined rates for empty references. Legacy
+    benchmark output represents a nonempty hypothesis against an empty
+    reference as WER 1.0, and clips word accuracy at zero.
+    """
+    score = _score_transcription(expected_text, actual_text)
+    word_error_rate = round(score.word_error_rate if score.word_error_rate is not None else 1.0, 3)
     return TranscriptScore(
         word_error_rate=word_error_rate,
         word_accuracy=round(max(0.0, 1.0 - word_error_rate), 3),
@@ -429,28 +409,26 @@ def parse_config_spec(spec: str) -> AsrBenchmarkConfig:
 
 def load_wav_samples(path: str | Path) -> tuple[list[float], float]:
     audio_path = Path(path)
-    with wave.open(str(audio_path), "rb") as wav:
-        channels = wav.getnchannels()
-        sample_width = wav.getsampwidth()
-        sample_rate = wav.getframerate()
-        frame_count = wav.getnframes()
-        frames = wav.readframes(frame_count)
+    try:
+        with wave.open(str(audio_path), "rb") as wav:
+            if wav.getsampwidth() != 2 or wav.getcomptype() != "NONE":
+                raise RuntimeError("Only 16-bit PCM WAV audio is supported by the ASR benchmark")
+            if wav.getnchannels() != 1:
+                raise RuntimeError("ASR benchmark WAV audio must be mono")
+            sample_rate = wav.getframerate()
+            if sample_rate != 16000:
+                raise RuntimeError("ASR benchmark WAV audio must use 16000 Hz (16 kHz); resample it first")
+            frame_count = wav.getnframes()
+            frames = wav.readframes(frame_count + 1)
+    except (wave.Error, EOFError) as exc:
+        raise RuntimeError(f"Invalid WAV audio: {exc}") from exc
 
-    if sample_width != 2:
-        raise RuntimeError("Only 16-bit PCM WAV audio is supported by the ASR benchmark")
-
-    samples: list[float] = []
-    frame_width = sample_width * channels
-    for offset in range(0, len(frames), frame_width):
-        channel_total = 0
-        for channel in range(channels):
-            sample_offset = offset + channel * sample_width
-            channel_total += int.from_bytes(
-                frames[sample_offset : sample_offset + sample_width],
-                "little",
-                signed=True,
-            )
-        samples.append((channel_total / channels) / 32768.0)
+    if len(frames) != frame_count * 2:
+        raise RuntimeError("Malformed or truncated WAV frames")
+    samples = [
+        int.from_bytes(frames[offset : offset + 2], "little", signed=True) / 32768.0
+        for offset in range(0, len(frames), 2)
+    ]
     return samples, frame_count / sample_rate
 
 
