@@ -8,6 +8,7 @@ from collections import Counter
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 from services.evaluation import collect
 from services.evaluation.manifest import load_manifest
 
@@ -110,5 +111,36 @@ class CorpusCollectionTests(unittest.TestCase):
         with self.assertRaises(ValueError): collect.export(self.path,self.root/'manifest.json',ids=[self.sid])
         audio.unlink()
         with self.assertRaises(ValueError): collect.export(self.path,self.root/'manifest.json',ids=[self.sid])
+
+    def test_post_commit_interrupt_retains_referenced_audio(self):
+        real_write = collect._write
+        def commit_then_interrupt(*args):
+            real_write(*args)
+            raise KeyboardInterrupt()
+        with patch.object(collect, '_write', side_effect=commit_then_interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                collect.record(self.path, self.sid, 2, input_fn=lambda _: 'yes', recorder=self.fake_record)
+        sample = collect._load(self.path, self.sid)[2]
+        audio = self.root / sample['audio']['path']
+        self.assertTrue(audio.exists())
+        import hashlib
+        self.assertEqual(sample['audio']['sha256'], hashlib.sha256(audio.read_bytes()).hexdigest())
+
+    def test_precommit_failure_removes_unreferenced_audio(self):
+        original = self.path.read_bytes()
+        with patch.object(collect, '_write', side_effect=OSError('before commit')):
+            with self.assertRaisesRegex(OSError, 'before commit'):
+                collect.record(self.path, self.sid, 2, input_fn=lambda _: 'yes', recorder=self.fake_record)
+        self.assertEqual(original, self.path.read_bytes())
+        self.assertFalse((self.root / 'audio' / f'{self.sid}.wav').exists())
+
+    def test_uncertain_persisted_state_retains_audio_and_original_failure(self):
+        def corrupt_then_fail(*args):
+            self.path.write_text('{unknown state', encoding='utf-8')
+            raise OSError('original write failure')
+        with patch.object(collect, '_write', side_effect=corrupt_then_fail):
+            with self.assertRaisesRegex(OSError, 'original write failure'):
+                collect.record(self.path, self.sid, 2, input_fn=lambda _: 'yes', recorder=self.fake_record)
+        self.assertTrue((self.root / 'audio' / f'{self.sid}.wav').exists())
 
 if __name__ == '__main__': unittest.main()

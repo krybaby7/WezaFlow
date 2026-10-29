@@ -94,6 +94,7 @@ def record(
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open('xb'):
         pass
+    publication_started = False
     try:
         recorder(target, seconds=seconds)
         sample['audio'] = {
@@ -102,9 +103,24 @@ def record(
         }
         sample.pop('verbatim', None)
         sample.pop('acceptable_final_texts', None)
+        publication_started = True
         _write(path, data)
     except BaseException:
-        target.unlink(missing_ok=True)
+        remove_target = not publication_started
+        if publication_started:
+            try:
+                # Atomic replacement may have completed before _write raised.
+                # Only delete when authoritative metadata proves noncommit;
+                # an unreadable/uncertain state must retain the recording.
+                persisted = _load(path, sid)[2]
+                remove_target = 'audio' not in persisted
+            except BaseException:
+                remove_target = False
+        if remove_target:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass  # Preserve the original capture/publication failure.
         raise
     return True
 

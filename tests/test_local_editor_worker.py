@@ -539,6 +539,15 @@ class LifecycleTests(unittest.TestCase):
                 kernel.CloseHandle(handle)
 
     def test_preassignment_owner_death_exits_gated_wrapper_within_startup_budget(self):
+        self._check_preassignment_owner()
+
+    def test_preassignment_readiness_failure_still_reaps_known_child(self):
+        cleanup = []
+        with self.assertRaisesRegex(AssertionError, 'fixture_readiness_failed'):
+            self._check_preassignment_owner(fail_readiness=True, cleanup=cleanup)
+        self.assertEqual(cleanup, [0])
+
+    def _check_preassignment_owner(self, *, fail_readiness=False, cleanup=None):
         import ctypes
         from ctypes import wintypes
         kernel = ctypes.WinDLL('kernel32',use_last_error=True)
@@ -546,17 +555,30 @@ class LifecycleTests(unittest.TestCase):
         kernel.OpenProcess.restype = wintypes.HANDLE
         kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE,wintypes.DWORD]
         kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-        owner = subprocess.Popen([sys.executable,str(Path(__file__).parent/'fixtures'/'local_editor_owner.py'),self.config.manifest_path,'--unassigned'],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,creationflags=subprocess.CREATE_NO_WINDOW)
+        kernel.TerminateProcess.argtypes = [wintypes.HANDLE,wintypes.UINT]
+        args = [sys.executable,str(Path(__file__).parent/'fixtures'/'local_editor_owner.py'),self.config.manifest_path,'--unassigned']
+        if fail_readiness:
+            args.append('--fail-readiness')
+        owner = subprocess.Popen(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,creationflags=subprocess.CREATE_NO_WINDOW)
         handle = None
-        try:
+        reader = None
+        # PID and readiness share the original total five-second budget.
+        deadline = time.monotonic()+5
+        def line():
+            nonlocal reader
             result = []
             reader = threading.Thread(target=lambda:result.append(owner.stdout.readline()),daemon=True)
             reader.start()
-            reader.join(5)
-            self.assertFalse(reader.is_alive())
-            pid = json.loads(result[0])['pid']
-            handle = kernel.OpenProcess(0x100000,False,pid)
+            reader.join(max(0,deadline-time.monotonic()))
+            self.assertFalse(reader.is_alive(), 'fixture readiness deadline expired')
+            self.assertTrue(result[0], 'fixture exited before readiness')
+            return json.loads(result[0])
+        try:
+            pid = line()['pid']
+            # Retain termination rights on this exact process even if readiness fails.
+            handle = kernel.OpenProcess(0x100001,False,pid)
             self.assertTrue(handle)
+            self.assertEqual(line(), {'kind':'gated'})
             owner.kill()
             owner.wait(3)
             self.assertEqual(kernel.WaitForSingleObject(handle,2000),0)
@@ -564,11 +586,16 @@ class LifecycleTests(unittest.TestCase):
             if owner.poll() is None:
                 owner.kill()
             if handle:
-                # Ensure the deliberately unassigned RED fixture cannot leak.
-                if kernel.WaitForSingleObject(handle,0) != 0:
-                    killer = kernel.OpenProcess(1,False,pid)
-                    kernel.TerminateProcess.argtypes = [wintypes.HANDLE,wintypes.UINT]
-                    kernel.TerminateProcess(killer,1)
-                    kernel.CloseHandle(killer)
-                kernel.CloseHandle(handle)
+                try:
+                    if kernel.WaitForSingleObject(handle,0) != 0:
+                        self.assertTrue(kernel.TerminateProcess(handle,1))
+                    status = kernel.WaitForSingleObject(handle,2000)
+                    if cleanup is not None:
+                        cleanup.append(status)
+                    self.assertEqual(status,0, 'unassigned fixture child survived cleanup')
+                finally:
+                    kernel.CloseHandle(handle)
             owner.communicate(timeout=3)
+            if reader is not None:
+                reader.join(1)
+                self.assertFalse(reader.is_alive(), 'fixture stdout reader survived cleanup')

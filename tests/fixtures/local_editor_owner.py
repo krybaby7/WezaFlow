@@ -19,8 +19,10 @@ if __name__ == '__main__':
         process = context.Process(target=gated_wait_child,args=(child,gate,config,1))
         process.start()
         child.close()
-        connection.recv_bytes()
         print(json.dumps({'pid':process.pid}),flush=True)
+        connection.recv_bytes()
+        kind = 'fixture_readiness_failed' if '--fail-readiness' in sys.argv else 'gated'
+        print(json.dumps({'kind':kind}),flush=True)
         time.sleep(60)
         raise SystemExit
     service = LocalEditorService()

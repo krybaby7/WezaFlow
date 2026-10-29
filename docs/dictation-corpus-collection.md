@@ -1,5 +1,21 @@
 # Collect the first 30 personal dictation samples
 
+For the first short guided set, run this single command from the repository root:
+
+```powershell
+./.venv/Scripts/python.exe -m services.evaluation.guided --output-dir "C:/Users/adami/projects/Hobby/Tier 1/WEZZA/artifacts/personal-dictation-first-six"
+```
+
+This persistent directory is outside the disposable recovery worktree. The command initializes or resumes six development samples: `en-01`, `en-06`, `fr-01`, `fr-06`, `ar-01`, and `ar-06`, with 12 seconds per take. At each unfinished sample, explicitly choose `record` (or `review` for existing audio), `skip`, or `quit`. Recording still requires a separate `yes` before the microphone opens. Optional playback requires its own `yes` and uses Windows audio; otherwise listen to the displayed local WAV externally before confirming references. Existing recordings are checked for contained paths, checksums and bounded mono 16-kHz PCM16 WAV format before review/playback. A retake requires a fresh directory.
+
+Enter verbatim speech and intended final text separately; neither is copied from the prompt. Blank reference entry cancels that review and keeps the recording. Review the actual language tags and displayed metadata, then explicitly confirm the references against the recording. Apply the sentence script/Arabizi policy below to what you actually said. For metadata corrections, protected literals, spans or multiple acceptable finals, use the manual annotation commands below. Skipped/incomplete samples prevent export of the selected set. Once every selected sample is confirmed, another explicit `yes` exports `manifest.json`; it never overwrites an existing manifest or starts model evaluation. On a completed collection, use a new `--export-filename` to export again. EOF or Ctrl+C preserves saved work and exits with status 130; resume using the same selection.
+
+For the **verbatim reference**, preserve spoken repetitions, corrections and grammatical mistakes. Write Arabic words in Arabic script even inside an English/French sentence, and English/French words in Latin script. Apply your sentence-start script policy only to the **intended final text**. This keeps the recognition reference separate from the desired editing. WER/CER still need human review: different valid spellings or renderings can count as differences without changing the meaning.
+
+Optional overrides are repeated `--id`, `--seconds` (greater than zero and at most 120), and `--export-filename` (a new `.json` filename directly inside the directory). All IDs, duration and export destination are checked before capture. Do not run concurrent commands on the same collection or commit personal data. These six samples support the first paired ASR/editor diagnosis; they do not replace the full 30-sample collection, spontaneous grammar/stutter/negation/protected-literal trials, or a separate held-out acceptance set. Automated tests use injected devices; real microphone/playback and reference correctness still require a user trial.
+
+## Manual collection and advanced annotations
+
 This workflow collects ten English, ten French, and ten Egyptian Arabic recordings before choosing models. The shipped prompts cover numbers, names, context, corrections, and selected bilingual/trilingual phrases. They are prompts only: change the wording naturally, and label what you actually said. There are no measured benchmark results yet.
 
 Run commands from the repository root with the project Python environment. All audio and annotations remain local in the chosen collection directory. Do not commit personal recordings or labels. `init`, `status`, `annotate`, and `export` never access the microphone. Only `record` imports the existing audio smoke adapter, and capture starts only after you type `yes` for one selected sample. It stops after the requested duration (maximum 120 seconds). Hardware/backend failures are reported by the adapter.
