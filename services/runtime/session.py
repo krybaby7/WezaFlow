@@ -53,35 +53,8 @@ class RuntimeSession:
         return self._start_recording(mode="dictation", selected_text="", language=language)
 
     def start_command_recording(self, *, language: str | None = None) -> bool:
-        if self.state is not RuntimeState.IDLE:
-            return False
-
-        if self.selection_reader is None:
-            self.logger.log("command_no_selection", reason="selection_reader_unavailable")
-            self.status.idle()
-            return False
-
-        try:
-            selected_text = self.selection_reader()
-        except Exception as exc:
-            self.state = RuntimeState.ERROR
-            self.last_error = exc
-            self.status.error(exc)
-            self.logger.log("dictation_error", phase="read_selection", error=str(exc))
-            self.state = RuntimeState.IDLE
-            self.status.idle()
-            return False
-
-        if not selected_text.strip():
-            self.logger.log("command_no_selection")
-            self.status.idle()
-            return False
-
-        return self._start_recording(
-            mode="command",
-            selected_text=selected_text,
-            language=language,
-        )
+        # Selection provenance is unavailable until M2. Never synthesize Ctrl+C here.
+        return False
 
     def _start_recording(
         self,
@@ -112,7 +85,7 @@ class RuntimeSession:
         self.status.recording()
         self.logger.log("recording_started", mode=mode)
         if mode == "dictation":
-            self._start_speculative(language=language)
+            pass  # Speculative duplicate inference is disabled in M1.
         return True
 
     def stop_and_process(self, *, language: str | None = None):
@@ -135,7 +108,7 @@ class RuntimeSession:
                 result, speculative_fields = self.speculative.stop(audio)
                 self.speculative = None
             if result is not None:
-                self._inject_result(result)
+                pass  # Results remain recoverable; no automatic insertion.
             else:
                 if mode == "command":
                     result = self.pipeline.process_command(selected_text, audio, language=language)
@@ -173,8 +146,7 @@ class RuntimeSession:
             )
         else:
             self.status.success(result)
-            if mode == "dictation" and self.correction_watcher is not None:
-                self.correction_watcher.start(result)
+            # No insertion occurred, so correction observation must not start.
             event = "command_success" if mode == "command" else "dictation_success"
             self.logger.log(
                 event,
@@ -273,14 +245,7 @@ class RuntimeSession:
         return fields
 
     def _inject_result(self, result: Any) -> None:
-        inject_result = getattr(self.pipeline, "inject_result", None)
-        if callable(inject_result):
-            inject_result(result)
-            return
-        injector = getattr(self.pipeline, "injector", None)
-        if injector is None:
-            raise RuntimeError("Speculative result cannot be injected by this pipeline")
-        injector.inject(result.polished_text)
+        raise RuntimeError("Automatic insertion is disabled until M2")
 
 
 class NullLogger:

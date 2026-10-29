@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -9,7 +9,7 @@ const tauriMocks = vi.hoisted(() => ({
   bringLocalFlowWindowForward: vi.fn(async () => undefined),
   configureDesktopSettings: vi.fn(async () => undefined),
   getDesktopWindowLabel: vi.fn(() => "main"),
-  listenToRecordingBarState: vi.fn(async () => () => undefined)
+  listenToRecordingBarState: vi.fn(async (_callback?: unknown) => () => undefined)
 }));
 
 vi.mock("./lib/tauri", () => ({
@@ -77,7 +77,7 @@ describe("App", () => {
     render(<App client={fakeClient()} />);
 
     expect(screen.getByRole("status", { name: "Recording feedback" })).toBeInTheDocument();
-    expect(screen.getByText("Listening")).toBeInTheDocument();
+    expect(screen.getByText("Idle")).toBeInTheDocument();
     expect(screen.queryByText(/^\d+:\d{2}$/)).not.toBeInTheDocument();
     expect(screen.queryByRole("tablist", { name: "Settings sections" })).not.toBeInTheDocument();
   });
@@ -119,13 +119,49 @@ describe("App", () => {
     expect(document.body).toHaveClass("recording-bar-window");
   });
 
-  it("requests runtime warmup after loading settings", async () => {
+  it("does not launch model warmup after loading settings", async () => {
     const warmRuntime = vi.fn(async () => undefined);
     render(<App client={fakeClient({ warmRuntime })} />);
 
     await screen.findByText("Runtime API connected");
 
-    await waitFor(() => expect(warmRuntime).toHaveBeenCalledTimes(1));
+    expect(warmRuntime).not.toHaveBeenCalled();
+  });
+
+  it("offers explicit recovery copy and identifies a retained earlier result", async () => {
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, "clipboard", {configurable: true, value: {writeText}});
+    const client = fakeClient({getStatus: vi.fn(async () => ({status:"ok",state:"error",mode:"dictation",profile:"low-impact",quiet_mode:false,quality_fallback:false,last_error:"Audio failed",session_id:"new",result_session_id:"previous",result:{raw_transcript:"hello",polished_text:"Hello."}}))});
+    render(<App client={client} />);
+    expect(await screen.findByLabelText("Recoverable dictation")).toHaveValue("Hello.");
+    expect(screen.getByText("Previous session result")).toBeInTheDocument();
+    expect(writeText).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", {name:"Copy result"}));
+    expect(writeText).toHaveBeenCalledWith("Hello.");
+  });
+
+  it("renders acknowledged processing, recovery and cancellation states after release", async () => {
+    tauriMocks.getDesktopWindowLabel.mockReturnValue("recording-bar");
+    render(<App client={fakeClient()} />);
+    const handler = tauriMocks.listenToRecordingBarState.mock.calls[0]?.[0] as unknown as (value: {state:string;mode:string}) => void;
+    for (const [state,label] of [["starting","Starting"],["recording","Listening"],["draining","Finishing recording"],["processing","Processing"],["ready","Ready to copy"],["cancelled","Cancelled"],["no_speech","No speech"],["error","Error"]]) {
+      await act(async () => handler({state,mode:"dictation"}));
+      expect(screen.getByText(label)).toBeInTheDocument();
+      expect(screen.getByRole("status",{name:"Recording feedback"})).toBeInTheDocument();
+    }
+  });
+
+  it("keeps persisted settings when shortcuts cannot reconfigure during capture", async () => {
+    const busy = {status:"ok",state:"processing",mode:"dictation",profile:"low-impact",quiet_mode:false,quality_fallback:false,last_error:null,busy:true};
+    const client=fakeClient({getStatus:vi.fn(async () => busy)});
+    render(<App client={client} />);
+    await screen.findByText("Runtime API connected");
+    tauriMocks.configureDesktopSettings.mockRejectedValueOnce(new Error("active session"));
+    await userEvent.click(screen.getByRole("tab",{name:"Dictation"}));
+    await userEvent.click(screen.getByRole("button",{name:"Save settings"}));
+    expect(await screen.findByText("Settings saved for the next session; desktop shortcuts will apply when recording finishes")).toBeInTheDocument();
+    expect(client.saveSettings).toHaveBeenCalledOnce();
+    expect(screen.getByLabelText(/Quality fallback/)).toBeDisabled();
   });
 
   it("saves edited hotkeys through the runtime API", async () => {
@@ -273,10 +309,39 @@ describe("App", () => {
 
     await waitFor(() => expect(getStatus).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(getDiagnostics).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(warmRuntime).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(warmRuntime).not.toHaveBeenCalled());
     expect(screen.getByText("snappy")).toBeInTheDocument();
     expect(screen.getByText(/Runtime: profile=snappy/)).toBeInTheDocument();
     expect(screen.queryByText(/Runtime: profile=low-impact model=small\.en/)).not.toBeInTheDocument();
+  });
+
+  it("sends profile-default intent only when the saved profile changes", async () => {
+    const saveSettings = vi.fn(async (settings, _applyProfileDefaults?: boolean) => settings);
+    render(<App client={fakeClient({saveSettings})} />);
+    await screen.findByText("Runtime API connected");
+    await userEvent.click(screen.getByRole("tab",{name:"Dictation"}));
+    fireEvent.change(screen.getByRole("combobox",{name:"ASR profile"}),{target:{value:"quality"}});
+    await userEvent.click(screen.getByRole("button",{name:"Save settings"}));
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledOnce());
+    expect(saveSettings.mock.calls[0][0].runtime.profile).toBe("quality");
+    expect(saveSettings.mock.calls[0][1]).toBe(true);
+    await screen.findByText("Settings saved");
+    await userEvent.click(screen.getByRole("button",{name:"Save settings"}));
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(2));
+    expect(saveSettings.mock.calls[1][1]).toBe(false);
+  });
+
+  it("retains profile intent after a failed settings save", async () => {
+    const saveSettings = vi.fn(async (settings, _applyProfileDefaults?: boolean) => settings).mockRejectedValueOnce(new Error("unavailable"));
+    render(<App client={fakeClient({saveSettings})} />);
+    await screen.findByText("Runtime API connected");
+    await userEvent.click(screen.getByRole("tab",{name:"Dictation"}));
+    fireEvent.change(screen.getByRole("combobox",{name:"ASR profile"}),{target:{value:"quality"}});
+    await userEvent.click(screen.getByRole("button",{name:"Save settings"}));
+    await screen.findByText("Settings could not be saved. Your profile change is still pending; try saving again.");
+    await userEvent.click(screen.getByRole("button",{name:"Save settings"}));
+    await screen.findByText("Settings saved");
+    expect(saveSettings.mock.calls.map(call => call[1])).toEqual([true,true]);
   });
 
   it("polls for a new pending correction, focuses the desktop window, and confirms it", async () => {

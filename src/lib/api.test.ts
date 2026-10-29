@@ -8,7 +8,17 @@ const jsonResponse = (payload: unknown) =>
     headers: { "Content-Type": "application/json" }
   });
 
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => ({status:"ok",state:"processing"})) }));
+
 describe("RuntimeApiClient", () => {
+  it("uses the authenticated Rust bridge by default without browser fetch", async () => {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(JSON.stringify({status:"ok"})));
+    await new RuntimeApiClient().getStatus();
+    expect(invoke).toHaveBeenCalledWith("runtime_request", {method:"GET",path:"/status",body:null});
+    expect(fetchSpy).not.toHaveBeenCalled();
+    fetchSpy.mockRestore();
+  });
   it("posts start and stop requests to the Python runtime API", async () => {
     const fetcher = vi.fn(async () => jsonResponse({ status: "ok" }));
     const client = new RuntimeApiClient("http://127.0.0.1:8765", fetcher);
@@ -44,6 +54,16 @@ describe("RuntimeApiClient", () => {
       "http://127.0.0.1:8765/runtime/warmup",
       expect.objectContaining({ method: "POST" })
     );
+  });
+
+  it("sends explicit profile application metadata only on request", async () => {
+    const fetcher=vi.fn(async () => jsonResponse({settings:{runtime:{profile:"quality"}}}));
+    const client=new RuntimeApiClient("http://fixture",fetcher);
+    const settings={runtime:{profile:"quality"}} as import("./api").Settings;
+    await client.saveSettings(settings,true);
+    expect(fetcher).toHaveBeenLastCalledWith("http://fixture/settings",expect.objectContaining({body:JSON.stringify({settings,apply_profile_defaults:true})}));
+    await client.saveSettings(settings);
+    expect(fetcher).toHaveBeenLastCalledWith("http://fixture/settings",expect.objectContaining({body:JSON.stringify({settings})}));
   });
 
   it("roundtrips settings and validates HTTP failures", async () => {

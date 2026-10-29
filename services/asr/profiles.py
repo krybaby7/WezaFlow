@@ -62,7 +62,7 @@ ASR_PROFILES: dict[str, AsrProfile] = {
         compute_type="int8",
         cpu_threads=4,
         speculative_cpu_threads=2,
-        speculative_enabled=True,
+        speculative_enabled=False,
         supported_languages=("en",),
     ),
     "quality": AsrProfile(
@@ -71,7 +71,8 @@ ASR_PROFILES: dict[str, AsrProfile] = {
         compute_type="int8",
         cpu_threads=6,
         speculative_cpu_threads=2,
-        speculative_enabled=True,
+        speculative_enabled=False,
+        supported_languages=("en",),
     ),
     "distil-small-en": AsrProfile(
         name="distil-small-en",

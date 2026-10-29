@@ -46,7 +46,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     },
     "runtime": {
         "profile": "low-impact",
-        "language": "en",
+        "language": "auto",
         "quiet_mode": False,
         "quality_fallback": False,
         "system_audio_ducking": True,
@@ -68,6 +68,15 @@ def load_settings(path: str | Path) -> dict[str, Any]:
 
     parsed = _load_yaml(settings_path.read_text(encoding="utf-8"))
     if isinstance(parsed, dict):
+        from services.asr.profiles import resolve_asr_profile
+        runtime_settings = parsed.get("runtime", {})
+        if not isinstance(runtime_settings, dict):
+            raise ValueError("runtime must be an object")
+        profile = resolve_asr_profile(runtime_settings.get("profile", "low-impact"))
+        settings["models"].update(whisper=profile.model_name,
+                                  whisper_compute_type=profile.compute_type,
+                                  whisper_cpu_threads=profile.cpu_threads)
+        # Explicit saved values override the chosen profile defaults.
         _deep_merge(settings, parsed)
     return settings
 

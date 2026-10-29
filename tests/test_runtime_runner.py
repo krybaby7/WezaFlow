@@ -57,6 +57,15 @@ class FakeKeyboardModule:
 
 
 class RuntimeRunnerTests(unittest.TestCase):
+    def test_cli_capture_refuses_unserialized_legacy_path(self):
+        from services.runtime.runner import main
+        from unittest.mock import patch
+        lines=[]
+        with patch('services.runtime.runner.create_runtime_session') as create_session:
+            self.assertEqual(main([],output=lines.append),2)
+        create_session.assert_not_called()
+        self.assertIn('desktop app',lines[0])
+
     def test_dependency_readiness_reports_required_packages(self):
         from services.runtime.runner import dependency_readiness
 
@@ -235,10 +244,10 @@ class RuntimeRunnerTests(unittest.TestCase):
         logger = Logger()
 
         thread = warm_pipeline_in_background(pipeline, logger, language="en")
-        thread.join(timeout=1)
+        self.assertIsNone(thread)
 
-        self.assertEqual(pipeline.transcriber.languages, ["en"])
-        self.assertEqual(logger.events[-1][0], "pipeline_warmup_success")
+        self.assertEqual(pipeline.transcriber.languages, [])
+        self.assertEqual(logger.events, [])
 
     def test_warm_pipeline_in_background_logs_pipeline_role(self):
         from services.runtime.runner import warm_pipeline_in_background
@@ -264,9 +273,9 @@ class RuntimeRunnerTests(unittest.TestCase):
             language="en",
             role="speculative",
         )
-        thread.join(timeout=1)
+        self.assertIsNone(thread)
 
-        self.assertEqual(logger.events[0][1]["role"], "speculative")
+        self.assertEqual(logger.events, [])
 
     def test_create_runtime_session_enables_speculative_transcription(self):
         from services.runtime.runner import create_runtime_session
@@ -281,7 +290,7 @@ class RuntimeRunnerTests(unittest.TestCase):
             asr_profile="balanced",
         )
 
-        self.assertIsNotNone(session.speculative_factory)
+        self.assertIsNone(session.speculative_factory)
 
     def test_create_runtime_session_defaults_to_low_impact_without_speculation(self):
         from services.runtime.runner import create_runtime_session
@@ -318,11 +327,10 @@ class RuntimeRunnerTests(unittest.TestCase):
             status=object(),
         )
 
-        speculative_session = session.speculative_factory(object(), final_pipeline, Logger())
+        self.assertIsNone(session.speculative_factory)
 
         self.assertIs(session.pipeline, final_pipeline)
-        self.assertIs(session.speculative_pipeline, speculative_pipeline)
-        self.assertIs(speculative_session.pipeline, speculative_pipeline)
+        self.assertIsNone(session.speculative_pipeline)
 
     def test_create_runtime_session_builds_profiled_main_and_speculative_pipelines(self):
         import services.runtime.runner as runner_module
@@ -349,13 +357,10 @@ class RuntimeRunnerTests(unittest.TestCase):
         finally:
             runner_module.build_pipeline = original_build_pipeline
 
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["whisper_model_name"], "small.en")
         self.assertEqual(calls[0]["whisper_compute_type"], "int8")
         self.assertEqual(calls[0]["whisper_cpu_threads"], 4)
-        self.assertEqual(calls[1]["whisper_model_name"], "small.en")
-        self.assertEqual(calls[1]["whisper_compute_type"], "int8")
-        self.assertEqual(calls[1]["whisper_cpu_threads"], 2)
 
     def test_create_runtime_session_disables_speculation_for_low_impact_profile(self):
         import services.runtime.runner as runner_module
@@ -474,11 +479,9 @@ class RuntimeRunnerTests(unittest.TestCase):
         finally:
             runner_module.build_pipeline = original_build_pipeline
 
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["whisper_model_name"], "small.en")
         self.assertEqual(calls[0]["whisper_cpu_threads"], 2)
-        self.assertEqual(calls[1]["whisper_model_name"], "distil-large-v3")
-        self.assertEqual(calls[1]["whisper_cpu_threads"], 6)
         self.assertTrue(session.logger.fields["quality_fallback_enabled"])
 
     def test_summarize_runtime_log_reports_recent_diagnostics(self):

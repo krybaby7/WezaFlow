@@ -22,36 +22,13 @@ def create_app(pipeline: Any | None = None):
         raise RuntimeError("fastapi is required to run the LocalFlow pipeline server") from exc
 
     app = create_runtime_api_app()
-    active_pipeline = pipeline or build_pipeline()
-
     @app.post("/process_samples")
     def process_samples(payload: dict[str, Any]) -> dict[str, Any]:
-        samples = payload.get("samples")
-        if not isinstance(samples, list):
-            raise HTTPException(status_code=400, detail="samples must be a list of floats")
-        result = active_pipeline.process_audio(
-            samples,
-            language=payload.get("language"),
-            inject=bool(payload.get("inject", True)),
-            vocabulary_hints=payload.get("vocabulary_hints"),
-        )
-        return serialize_result(result)
+        raise HTTPException(status_code=409, detail="Legacy processing is unavailable; use serialized runtime sessions")
 
     @app.post("/command")
     def command(payload: dict[str, Any]) -> dict[str, Any]:
-        selected_text = payload.get("selected_text")
-        samples = payload.get("samples")
-        if not isinstance(selected_text, str):
-            raise HTTPException(status_code=400, detail="selected_text must be a string")
-        if not isinstance(samples, list):
-            raise HTTPException(status_code=400, detail="samples must be a list of floats")
-        result = active_pipeline.process_command(
-            selected_text,
-            samples,
-            language=payload.get("language"),
-            inject=bool(payload.get("inject", True)),
-        )
-        return serialize_result(result)
+        raise HTTPException(status_code=409, detail="Command editing is unavailable until M2")
 
     return app
 

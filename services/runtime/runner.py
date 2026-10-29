@@ -105,29 +105,8 @@ def warm_pipeline_in_background(
     language: str | None,
     role: str = "main",
 ) -> Thread | None:
-    transcriber = getattr(pipeline, "transcriber", None)
-    warm_up = getattr(transcriber, "warm_up", None)
-    if not callable(warm_up):
-        return None
-
-    def target() -> None:
-        started = time.perf_counter()
-        logger.log("pipeline_warmup_started", language=language or "auto", role=role)
-        try:
-            warm_up(language=language)
-        except Exception as exc:
-            logger.log("pipeline_warmup_error", error=str(exc), role=role)
-            return
-        logger.log(
-            "pipeline_warmup_success",
-            language=language or "auto",
-            role=role,
-            duration_ms=int((time.perf_counter() - started) * 1000),
-        )
-
-    thread = Thread(target=target, name=f"localflow-whisper-{role}-warmup", daemon=True)
-    thread.start()
-    return thread
+    # M1 owns all model work in its bounded session worker.
+    return None
 
 
 def create_runtime_session(
@@ -156,39 +135,11 @@ def create_runtime_session(
         quiet_mode=quiet_mode,
         **profile.pipeline_kwargs(),
     )
-    use_speculative = profile.speculative_enabled or speculative_pipeline is not None
+    # Speculation and fallback duplicate model jobs are disabled until measured.
     resolved_speculative_pipeline = None
     speculative_factory = None
-    if use_speculative:
-        resolved_speculative_pipeline = speculative_pipeline
-        if resolved_speculative_pipeline is None and pipeline is None:
-            resolved_speculative_pipeline = build_pipeline(
-                root=root,
-                use_ollama=use_ollama,
-                quiet_mode=quiet_mode,
-                **profile.pipeline_kwargs(speculative=True),
-            )
-        elif resolved_speculative_pipeline is None:
-            resolved_speculative_pipeline = resolved_pipeline
-        speculative_factory = (
-            lambda recorder, _pipeline, logger: create_speculative_session(
-                recorder,
-                resolved_speculative_pipeline,
-                logger,
-            )
-        )
-
     fallback_pipeline = None
     fallback_profile_name = None
-    if quality_fallback:
-        fallback_profile = resolve_asr_profile("quality")
-        fallback_profile_name = fallback_profile.name
-        fallback_pipeline = build_pipeline(
-            root=root,
-            use_ollama=use_ollama,
-            quiet_mode=quiet_mode,
-            **fallback_profile.pipeline_kwargs(),
-        )
 
     context_provider = getattr(resolved_pipeline, "context_provider", get_active_app_context)
     correction_watcher = CorrectionWatcher(context_provider=context_provider)
@@ -464,7 +415,7 @@ def main(
     parser.add_argument("--cancel-key", default="esc")
     parser.add_argument(
         "--language",
-        default="en",
+        default="auto",
         help="Language hint for Whisper. Use 'auto' to enable language detection.",
     )
     parser.add_argument("--root", type=Path, default=None)
@@ -500,53 +451,8 @@ def main(
             output(line)
         return 0
 
-    try:
-        language = normalize_language_arg(args.language)
-        session = create_runtime_session(
-            root=args.root,
-            use_ollama=args.use_ollama,
-            logger_path=args.log,
-            asr_profile=args.asr_profile,
-            quiet_mode=args.quiet,
-            quality_fallback=args.quality_fallback,
-            selection_reader=create_selection_reader(),
-        )
-        warm_pipeline_in_background(session.pipeline, session.logger, language=language, role="main")
-        if session.speculative_pipeline is not None and session.speculative_pipeline is not session.pipeline:
-            warm_pipeline_in_background(
-                session.speculative_pipeline,
-                session.logger,
-                language=language,
-                role="speculative",
-            )
-        controller = create_runtime_hotkey_controller(
-            session,
-            hotkey=args.hotkey,
-            command_hotkey=args.command_hotkey,
-            cancel_key=args.cancel_key,
-            language=language,
-        )
-        correction_observer = CorrectionKeyObserver(session.correction_watcher)
-        controller.start()
-        correction_observer.start()
-    except Exception as exc:
-        output(format_user_error(exc))
-        return 1
-
-    output(
-        f"LocalFlow running with {args.asr_profile} ASR profile. Hold {args.hotkey} to dictate, "
-        f"hold {args.command_hotkey} to edit selected text, press {args.cancel_key} to cancel, "
-        f"Ctrl+C to exit."
-    )
-    try:
-        while True:
-            time.sleep(0.25)
-    except KeyboardInterrupt:
-        output("LocalFlow stopped.")
-        return 0
-    finally:
-        correction_observer.stop()
-        controller.stop()
+    output("CLI capture is unavailable during the session safety rebuild. Start the desktop app for serialized capture and explicit result recovery; --check and --diagnostics remain available.")
+    return 2
 
 
 if __name__ == "__main__":

@@ -32,9 +32,11 @@ class PipelineOrchestrator:
         audio: Any,
         *,
         language: str | None = None,
-        inject: bool = True,
+        inject: bool = False,
         vocabulary_hints: list[str] | None = None,
     ) -> PipelineResult | None:
+        if inject:
+            raise RuntimeError("Automatic insertion is disabled until M2")
         started = time.perf_counter()
         phase_started = time.perf_counter()
         app_context = self.context_provider()
@@ -64,8 +66,8 @@ class PipelineOrchestrator:
         format_ms = self._elapsed_ms(phase_started)
 
         phase_started = time.perf_counter()
-        if inject:
-            self.injector.inject(polished_text)
+        # M1: processing is pure; insertion requires the future M2 transaction.
+        del inject
         inject_ms = self._elapsed_ms(phase_started)
         total_ms = self._elapsed_ms(started)
 
@@ -91,8 +93,10 @@ class PipelineOrchestrator:
         audio: Any,
         *,
         language: str | None = None,
-        inject: bool = True,
+        inject: bool = False,
     ) -> PipelineResult | None:
+        if inject:
+            raise RuntimeError("Automatic insertion is disabled until M2")
         started = time.perf_counter()
         phase_started = time.perf_counter()
         app_context = self.context_provider()
@@ -117,8 +121,7 @@ class PipelineOrchestrator:
         format_ms = self._elapsed_ms(phase_started)
 
         phase_started = time.perf_counter()
-        if inject:
-            self.injector.inject(edit_result.text)
+        del inject
         inject_ms = self._elapsed_ms(phase_started)
         total_ms = self._elapsed_ms(started)
 
@@ -145,7 +148,7 @@ class PipelineOrchestrator:
         return {}
 
     def inject_result(self, result: PipelineResult) -> None:
-        self.injector.inject(result.polished_text)
+        raise RuntimeError("Automatic insertion is disabled until M2")
 
     def _expand_or_format(
         self,

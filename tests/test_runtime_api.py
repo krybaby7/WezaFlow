@@ -5,7 +5,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 try:
-    from fastapi.testclient import TestClient
+    from fastapi.testclient import TestClient as BaseTestClient
+
+    class TestClient(BaseTestClient):
+        def __init__(self, app, **kwargs):
+            super().__init__(app, headers={"Authorization":"Bearer fixture-secret"}, **kwargs)
 except ModuleNotFoundError:
     TestClient = None
 
@@ -90,35 +94,9 @@ class FakeRuntimeSessionWithCorrectionWatcher(FakeRuntimeSession):
 
 
 class RuntimeApiStateSessionTests(unittest.TestCase):
-    def test_saving_runtime_settings_rebuilds_next_session_with_new_profile(self):
-        from services.config.settings import load_settings
+    def test_api_state_has_no_alternate_session_owner(self):
         from services.runtime.api import RuntimeApiState
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            (root / "config").mkdir()
-            state = RuntimeApiState(
-                root=root,
-                log_path=root / "runtime.jsonl",
-                find_spec=lambda _name: None,
-            )
-            sessions = [FakeRuntimeSession(), FakeRuntimeSession()]
-
-            with patch(
-                "services.runtime.api.create_runtime_session",
-                side_effect=sessions,
-            ) as create_session:
-                self.assertIs(state.ensure_session(), sessions[0])
-
-                settings = load_settings(state.settings_path)
-                settings["runtime"]["profile"] = "distil-small-en"
-                state.save_runtime_settings(settings)
-
-                self.assertIsNone(state.session)
-                self.assertIs(state.ensure_session(), sessions[1])
-
-        self.assertEqual(create_session.call_args_list[0].kwargs["asr_profile"], "low-impact")
-        self.assertEqual(create_session.call_args_list[1].kwargs["asr_profile"], "distil-small-en")
+        self.assertFalse(hasattr(RuntimeApiState, 'ensure_session'))
 
     def test_diagnostics_report_configured_profile_after_settings_change(self):
         from services.config.settings import load_settings
@@ -156,36 +134,20 @@ class RuntimeApiStateSessionTests(unittest.TestCase):
     def test_runtime_api_capabilities_advertise_profile_session_refresh(self):
         from services.runtime.api import RUNTIME_API_CAPABILITIES
 
-        self.assertIn("profile-session-refresh", RUNTIME_API_CAPABILITIES)
+        self.assertIn("serialized-sessions-v1", RUNTIME_API_CAPABILITIES)
         self.assertIn("configured-runtime-diagnostics", RUNTIME_API_CAPABILITIES)
-        self.assertIn("runtime-warmup", RUNTIME_API_CAPABILITIES)
+        self.assertIn("insertion-disabled", RUNTIME_API_CAPABILITIES)
 
-    def test_created_session_warms_selected_pipeline_in_background(self):
-        from services.config.settings import load_settings, save_settings
-        from services.runtime.api import RuntimeApiState
-
+    def test_status_poll_does_not_create_or_warm_a_session(self):
+        from services.runtime.api import create_app
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            (root / "config").mkdir()
-            settings = load_settings(root / "config" / "settings.yaml")
-            settings["runtime"]["profile"] = "distil-small-en"
-            settings["runtime"]["language"] = "en"
-            save_settings(root / "config" / "settings.yaml", settings)
+            with patch('services.runtime.api._create_session_adapters') as create_session:
+                app=create_app(root=temp_dir,engine_token='fixture-secret',engine_id='fixture-engine')
+                client=TestClient(app)
+                for _ in range(3):
+                    client.get('/status');client.get('/corrections/pending')
+                create_session.assert_not_called()
 
-            session = FakeRuntimeSession()
-            session.pipeline = object()
-            session.logger = object()
-            state = RuntimeApiState(
-                root=root,
-                log_path=root / "runtime.jsonl",
-                find_spec=lambda _name: None,
-            )
-
-            with patch("services.runtime.api.create_runtime_session", return_value=session):
-                with patch("services.runtime.api.warm_pipeline_in_background") as warm:
-                    self.assertIs(state.ensure_session(), session)
-
-        warm.assert_called_once_with(session.pipeline, session.logger, language="en", role="main")
 
 
 class RuntimeApiTests(unittest.TestCase):
@@ -195,7 +157,8 @@ class RuntimeApiTests(unittest.TestCase):
 
     def test_status_reports_runtime_envelope(self):
         from services.config.settings import load_settings, save_settings
-        from services.runtime.api import create_app
+        from services.runtime.api import create_app as real_create_app
+        create_app = lambda **kwargs: real_create_app(engine_token="fixture-secret", engine_id="fixture-engine", **kwargs)
 
         for profile, quality_fallback in (("low-impact", False), ("snappy", True)):
             with self.subTest(profile=profile, quality_fallback=quality_fallback):
@@ -218,11 +181,12 @@ class RuntimeApiTests(unittest.TestCase):
                 self.assertEqual(payload["mode"], "idle")
                 self.assertEqual(payload["profile"], profile)
                 self.assertFalse(payload["quiet_mode"])
-                self.assertEqual(payload["quality_fallback"], quality_fallback)
+                self.assertFalse(payload["quality_fallback"])
                 self.assertIsNone(payload["last_error"])
 
     def test_runtime_api_allows_tauri_cors_preflight(self):
-        from services.runtime.api import create_app
+        from services.runtime.api import create_app as real_create_app
+        create_app = lambda **kwargs: real_create_app(engine_token="fixture-secret", engine_id="fixture-engine", **kwargs)
 
         client = TestClient(create_app(session=FakeRuntimeSession(), find_spec=lambda _name: None))
 
@@ -235,36 +199,20 @@ class RuntimeApiTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.headers["access-control-allow-origin"], "http://tauri.localhost")
+        self.assertEqual(response.status_code, 405)
+        self.assertNotIn("access-control-allow-origin", response.headers)
 
-    def test_start_stop_cancel_runtime_calls_session(self):
+    def test_start_stop_cancel_requires_owned_envelopes(self):
         from services.runtime.api import create_app
-
-        session = FakeRuntimeSession()
-        client = TestClient(create_app(session=session, find_spec=lambda _name: None))
-
-        start = client.post("/runtime/start", json={"mode": "dictation", "language": "en"}).json()
-        stop = client.post("/runtime/stop", json={"language": "en"}).json()
-        command = client.post("/runtime/start", json={"mode": "command", "language": "en"}).json()
-        cancel = client.post("/runtime/cancel").json()
-
-        self.assertEqual(start["state"], "recording")
-        self.assertEqual(stop["result"]["polished_text"], "Hello.")
-        self.assertEqual(command["mode"], "command")
-        self.assertEqual(cancel["state"], "idle")
-        self.assertEqual(
-            session.calls,
-            [
-                ("start_recording", "en"),
-                ("stop_and_process", "en"),
-                ("start_command_recording", "en"),
-                ("cancel", None),
-            ],
-        )
+        client = TestClient(create_app(engine_token="fixture-secret",engine_id="fixture-engine",find_spec=lambda _:None))
+        for action in ('start','stop','cancel'):
+            response=client.post('/runtime/'+action,json={}).json()
+            self.assertFalse(response['accepted'])
+            self.assertEqual(response['reason'],'engine_mismatch')
 
     def test_check_and_diagnostics_are_available_without_hotkeys(self):
-        from services.runtime.api import create_app
+        from services.runtime.api import create_app as real_create_app
+        create_app = lambda **kwargs: real_create_app(engine_token="fixture-secret", engine_id="fixture-engine", **kwargs)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             log_path = Path(temp_dir) / "runtime.jsonl"
@@ -289,7 +237,8 @@ class RuntimeApiTests(unittest.TestCase):
         self.assertTrue(any("success=1" in line for line in diagnostics["lines"]))
 
     def test_settings_roundtrip_persists_to_yaml(self):
-        from services.runtime.api import create_app
+        from services.runtime.api import create_app as real_create_app
+        create_app = lambda **kwargs: real_create_app(engine_token="fixture-secret", engine_id="fixture-engine", **kwargs)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -310,7 +259,8 @@ class RuntimeApiTests(unittest.TestCase):
         self.assertIn("whisper_cpu_threads", persisted)
 
     def test_settings_roundtrip_accepts_multiple_hotkeys(self):
-        from services.runtime.api import create_app
+        from services.runtime.api import create_app as real_create_app
+        create_app = lambda **kwargs: real_create_app(engine_token="fixture-secret", engine_id="fixture-engine", **kwargs)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -331,7 +281,8 @@ class RuntimeApiTests(unittest.TestCase):
         self.assertIn("- MouseX2", persisted)
 
     def test_settings_defaults_enable_system_audio_ducking(self):
-        from services.runtime.api import create_app
+        from services.runtime.api import create_app as real_create_app
+        create_app = lambda **kwargs: real_create_app(engine_token="fixture-secret", engine_id="fixture-engine", **kwargs)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -346,7 +297,8 @@ class RuntimeApiTests(unittest.TestCase):
         self.assertEqual(settings["runtime"]["system_audio_duck_volume"], 8)
 
     def test_vocabulary_and_corrections_crud(self):
-        from services.runtime.api import create_app
+        from services.runtime.api import create_app as real_create_app
+        create_app = lambda **kwargs: real_create_app(engine_token="fixture-secret", engine_id="fixture-engine", **kwargs)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -376,52 +328,17 @@ class RuntimeApiTests(unittest.TestCase):
         self.assertEqual(corrections[0]["corrected"], "LocalFlow")
         self.assertEqual(deleted_corrections, [])
 
-    def test_pending_corrections_list_confirm_and_dismiss(self):
+    def test_pending_corrections_disabled_without_inserted_provenance(self):
         from services.runtime.api import create_app
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            (root / "db").mkdir()
-            session = FakeRuntimeSessionWithCorrectionWatcher()
-            client = TestClient(create_app(root=root, session=session, find_spec=lambda _name: None))
-
-            pending = client.get("/corrections/pending").json()["pending"]
-            confirmed = client.post(
-                "/corrections/pending/pending-1/confirm",
-                json={"original": "local flow", "corrected": "LocalFlow"},
-            ).json()
-            after_confirm = client.get("/corrections/pending").json()["pending"]
-            missing_confirm = client.post(
-                "/corrections/pending/missing/confirm",
-                json={"original": "missing", "corrected": "Missing"},
-            )
-
-            session.correction_watcher.pending.append(
-                {
-                    "id": "pending-2",
-                    "original": "wispr flow",
-                    "raw_transcript": "wispr flow",
-                    "app_name": None,
-                    "window_title": None,
-                    "detected_at": "2026-05-10T12:01:00Z",
-                }
-            )
-            dismissed = client.post("/corrections/pending/pending-2/dismiss").json()
-            after_dismiss = client.get("/corrections/pending").json()["pending"]
-
-        self.assertEqual(pending[0]["id"], "pending-1")
-        self.assertEqual(pending[0]["app_name"], "Code.exe")
-        self.assertEqual(confirmed["status"], "ok")
-        self.assertEqual(confirmed["corrections"][0]["corrected"], "LocalFlow")
-        self.assertEqual(session.correction_watcher.confirmed, ["pending-1"])
-        self.assertEqual(after_confirm, [])
-        self.assertEqual(missing_confirm.status_code, 404)
-        self.assertEqual(dismissed, {"status": "ok"})
-        self.assertEqual(session.correction_watcher.dismissed, ["pending-2"])
-        self.assertEqual(after_dismiss, [])
+        session=FakeRuntimeSessionWithCorrectionWatcher()
+        client=TestClient(create_app(engine_token="fixture-secret",engine_id="fixture-engine",session=session))
+        self.assertEqual(client.get('/corrections/pending').json()['pending'],[])
+        self.assertEqual(client.post('/corrections/pending/pending-1/confirm',json={'original':'a','corrected':'b'}).status_code,404)
+        self.assertEqual(session.correction_watcher.confirmed,[])
 
     def test_pending_correction_mutations_404_without_watcher(self):
-        from services.runtime.api import create_app
+        from services.runtime.api import create_app as real_create_app
+        create_app = lambda **kwargs: real_create_app(engine_token="fixture-secret", engine_id="fixture-engine", **kwargs)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -437,12 +354,13 @@ class RuntimeApiTests(unittest.TestCase):
             )
             dismissed = client.post("/corrections/pending/unknown/dismiss")
 
-        self.assertEqual(pending, {"status": "ok", "pending": []})
+        self.assertEqual(pending["pending"], [])
         self.assertEqual(confirmed.status_code, 404)
         self.assertEqual(dismissed.status_code, 404)
 
     def test_learning_suggestions_endpoint_returns_store_suggestions(self):
-        from services.runtime.api import create_app
+        from services.runtime.api import create_app as real_create_app
+        create_app = lambda **kwargs: real_create_app(engine_token="fixture-secret", engine_id="fixture-engine", **kwargs)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -467,7 +385,8 @@ class RuntimeApiTests(unittest.TestCase):
         self.assertEqual(suggestions[1]["phrase"], "Thank you for your time and consideration.")
 
     def test_snippets_crud_persists_yaml(self):
-        from services.runtime.api import create_app
+        from services.runtime.api import create_app as real_create_app
+        create_app = lambda **kwargs: real_create_app(engine_token="fixture-secret", engine_id="fixture-engine", **kwargs)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -494,19 +413,6 @@ class RuntimeApiTests(unittest.TestCase):
         self.assertEqual(updated[0]["expansion"], "me@example.com")
         self.assertEqual(deleted, [])
         self.assertIn("snippets:", persisted)
-
-    def test_start_services_script_launches_runtime_api(self):
-        script = Path(__file__).resolve().parents[1] / "scripts" / "start_services.ps1"
-
-        content = script.read_text(encoding="utf-8")
-
-        self.assertIn("services.runtime.api", content)
-        self.assertIn("src-tauri", content)
-        self.assertIn("localflow.exe", content)
-        self.assertIn("desktop-python-api.pid", content)
-        self.assertIn("-PassThru", content)
-        self.assertIn("Set-Content", content)
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -59,14 +59,14 @@ class PipelineServerTests(unittest.TestCase):
                     save_settings(settings_path, settings)
                     with patch(
                         "services.pipeline_server.create_runtime_api_app",
-                        side_effect=lambda: create_runtime_api_app(root=root),
+                        side_effect=lambda: create_runtime_api_app(root=root,engine_token="fixture-secret",engine_id="fixture-engine"),
                     ):
                         client = TestClient(create_app(pipeline=object()))
-                    payload = client.get("/status").json()
+                    payload = client.get("/status",headers={"Authorization":"Bearer fixture-secret"}).json()
 
                 self.assertEqual(payload["status"], "ok")
                 self.assertEqual(payload["profile"], profile)
-                self.assertEqual(payload["quality_fallback"], quality_fallback)
+                self.assertFalse(payload["quality_fallback"])
 
 
 

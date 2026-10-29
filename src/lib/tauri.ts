@@ -1,7 +1,7 @@
 import type { Settings } from "./api";
 import type { HotkeySettings } from "./shortcuts";
 
-export type RecordingBarState = "listening" | "command" | "processing" | "done" | "error";
+export type RecordingBarState = "idle" | "starting" | "recording" | "draining" | "processing" | "ready" | "no_speech" | "cancelled" | "error";
 export type RecordingBarMode = "dictation" | "command";
 
 export type RecordingBarStatePayload = {

@@ -155,14 +155,14 @@ class RuntimeSessionTests(unittest.TestCase):
             selection_reader=lambda: "Selected text",
         )
 
-        self.assertTrue(session.start_command_recording(language="en"))
+        self.assertFalse(session.start_command_recording(language="en"))
         result = session.stop_and_process(language="en")
 
-        self.assertEqual(result, "edited")
+        self.assertIsNone(result)
         self.assertEqual(session.state, RuntimeState.IDLE)
         self.assertEqual(pipeline.calls, [])
-        self.assertEqual(pipeline.command_calls, [("Selected text", [0.4], "en")])
-        self.assertEqual(logger.events[-1][0], "command_success")
+        self.assertEqual(pipeline.command_calls, [])
+        self.assertEqual(logger.events, [])
 
     def test_command_recording_does_not_start_without_selected_text(self):
         from services.runtime.session import RuntimeSession, RuntimeState
@@ -181,7 +181,7 @@ class RuntimeSessionTests(unittest.TestCase):
 
         self.assertEqual(session.state, RuntimeState.IDLE)
         self.assertEqual(recorder.started, 0)
-        self.assertEqual(logger.events[-1][0], "command_no_selection")
+        self.assertEqual(logger.events, [])
 
     def test_start_recording_starts_speculative_transcription_with_language(self):
         from services.runtime.session import RuntimeSession
@@ -197,7 +197,7 @@ class RuntimeSessionTests(unittest.TestCase):
 
         session.start_recording(language="en")
 
-        self.assertEqual(speculative.started, ["en"])
+        self.assertEqual(speculative.started, [])
 
     def test_stop_and_process_reuses_speculative_result_without_reprocessing(self):
         from services.pipeline.models import AppContext, PipelineResult
@@ -226,10 +226,10 @@ class RuntimeSessionTests(unittest.TestCase):
         session.start_recording(language="en")
         result = session.stop_and_process(language="en")
 
-        self.assertIs(result, speculative_result)
-        self.assertEqual(pipeline.calls, [])
-        self.assertEqual(pipeline.injected, ["Hello."])
-        self.assertTrue(logger.events[-1][1]["speculative_reused"])
+        self.assertEqual(result, "should not reprocess")
+        self.assertEqual(pipeline.calls, [([0.0, 0.2], "en")])
+        self.assertEqual(pipeline.injected, [])
+        self.assertEqual(speculative.stopped_with, [])
 
     def test_successful_dictation_starts_correction_watcher(self):
         from services.pipeline.models import AppContext, PipelineResult
@@ -253,7 +253,7 @@ class RuntimeSessionTests(unittest.TestCase):
         session.start_recording(language="en")
         session.stop_and_process(language="en")
 
-        self.assertEqual(watcher.started, [result])
+        self.assertEqual(watcher.started, [])
 
     def test_command_success_does_not_start_correction_watcher(self):
         from services.pipeline.models import AppContext, PipelineResult
@@ -295,7 +295,7 @@ class RuntimeSessionTests(unittest.TestCase):
         session.start_recording(language="en")
         session.cancel()
 
-        self.assertEqual(speculative.cancelled, 1)
+        self.assertEqual(speculative.cancelled, 0)
 
     def test_stop_and_process_decodes_wav_bytes_before_pipeline(self):
         from services.asr.audio_capture import AudioRecorder

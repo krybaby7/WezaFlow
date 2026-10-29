@@ -8,6 +8,10 @@ export type RuntimeStatus = {
   quiet_mode: boolean;
   quality_fallback: boolean;
   last_error: string | null;
+  session_id?: string | null;
+  result_session_id?: string | null;
+  busy?: boolean;
+  result?: {raw_transcript: string; polished_text: string} | null;
 };
 
 export type DependencyStatus = {
@@ -70,7 +74,7 @@ export type LearningSuggestion =
 export class RuntimeApiClient {
   constructor(
     private readonly baseUrl = "http://127.0.0.1:8765",
-    private readonly fetcher: Fetcher = globalThis.fetch.bind(globalThis)
+    private readonly fetcher?: Fetcher
   ) {}
 
   getStatus(): Promise<RuntimeStatus> {
@@ -104,10 +108,10 @@ export class RuntimeApiClient {
     return payload.settings;
   }
 
-  async saveSettings(settings: Settings): Promise<Settings> {
+  async saveSettings(settings: Settings, applyProfileDefaults = false): Promise<Settings> {
     const payload = await this.request<{ settings: Settings }>("/settings", {
       method: "PUT",
-      body: JSON.stringify({ settings })
+      body: JSON.stringify({ settings, ...(applyProfileDefaults ? { apply_profile_defaults: true } : {}) })
     });
     return payload.settings;
   }
@@ -226,6 +230,15 @@ export class RuntimeApiClient {
   }
 
   private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
+    if (!this.fetcher) {
+      const { invoke } = await import("@tauri-apps/api/core");
+      return invoke<T>("runtime_request", {
+        method: init.method ?? "GET", path,
+        body: typeof init.body === "string" ? JSON.parse(init.body) : null
+      });
+    }
+    // An explicitly supplied transport is for isolated fixtures; production
+    // calls keep per-run credentials entirely inside Rust.
     const response = await this.fetcher(`${this.baseUrl}${path}`, {
       headers: {
         "Content-Type": "application/json",

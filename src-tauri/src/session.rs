@@ -1,0 +1,505 @@
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn release_is_retained_and_only_initiating_binding_owns_it() {
+        let mut c = SessionControl::default();
+        let start = c.press("keyboard:1", "dictation", "session").unwrap();
+        assert!(c.press("mouse:X1", "dictation", "other").is_none());
+        assert!(c.release("mouse:X1").is_none());
+        let stop = c.release("keyboard:1").unwrap();
+        assert_eq!((start.command_seq, stop.command_seq), (1, 2));
+        assert_eq!(start.session_id, stop.session_id);
+        assert!(c.release("keyboard:1").is_none());
+        assert_eq!(c.cancel().unwrap().command_seq, 3);
+        assert!(c.cancel().is_none());
+    }
+    #[test]
+    fn stale_identity_and_status_cannot_commit() {
+        let a = EngineIdentity {
+            token: "secret".into(),
+            engine_id: "old".into(),
+        };
+        let b = EngineIdentity {
+            token: "new-secret".into(),
+            engine_id: "new".into(),
+        };
+        let reply =
+            serde_json::json!({"application_id":"wezza","protocol_version":1,"engine_id":"old"});
+        assert!(validate_reply(&a, Some(&a), &reply).is_ok());
+        assert!(validate_reply(&a, Some(&b), &reply).is_err());
+        let mut c = SessionControl::default();
+        c.press("one", "dictation", "first");
+        assert!(!c.finish("old"));
+        assert!(c.finish("first"));
+        c.press("two", "dictation", "second");
+        assert!(!c.finish("first"));
+    }
+    #[test]
+    fn observations_are_generation_scoped_and_terminal_commit_is_once() {
+        let mut c = SessionControl::default();
+        c.press("key:1", "dictation", "first");
+        let busy = serde_json::json!({"session_id":"first","state":"cancelled","busy":true});
+        assert!(!c.observe("first", &busy).unwrap().finished);
+        assert!(c.press("key:2", "dictation", "second").is_none());
+        let done = serde_json::json!({"session_id":"first","state":"ready","busy":false});
+        assert!(c.observe("first", &done).unwrap().finished);
+        assert!(c.observe("first", &done).is_none());
+        c.press("key:2", "dictation", "second");
+        assert!(c.observe("first", &done).is_none());
+        assert_eq!(c.active.unwrap().session_id, "second");
+    }
+    #[test]
+    fn uncertain_transport_failure_retains_owner_and_retries_same_cancel() {
+        let mut c = SessionControl::default();
+        c.press("key:1", "dictation", "first");
+        let cancel = c.failure_cancel("first").unwrap();
+        assert_eq!(cancel.action, "cancel");
+        assert_eq!(
+            c.failure_cancel("first").unwrap().command_seq,
+            cancel.command_seq
+        );
+        assert!(c.failure_cancel("old").is_none());
+        assert!(c.press("key:2", "dictation", "second").is_none());
+    }
+    #[test]
+    fn relative_api_queries_allow_encoded_values_without_url_redirection() {
+        assert!(protected_path(
+            "/vocabulary/corrections?original=hello%20world&corrected=%D8%A7%2Fbonjour"
+        )
+        .is_ok());
+        assert!(protected_path("/runtime/diagnostics?limit=10").is_ok());
+        for path in [
+            "https://evil.invalid/",
+            "//evil.invalid/",
+            "/runtime/../health",
+            "/runtime/%2e%2e/health",
+            "/status#fragment",
+            "/status\\evil",
+            "/status\r\nInjected: secret",
+        ] {
+            assert!(protected_path(path).is_err(), "{path}");
+        }
+    }
+    #[test]
+    fn handshake_requires_serialized_recoverable_insertion_disabled_capabilities() {
+        let valid = serde_json::json!({"capabilities":["serialized-sessions-v1","recoverable-results","insertion-disabled"]});
+        assert!(validate_handshake(&valid).is_ok());
+        assert!(
+            validate_handshake(&serde_json::json!({"capabilities":["runtime-warmup"]})).is_err()
+        );
+        assert!(validate_handshake(&serde_json::json!({"capabilities":[]})).is_err());
+    }
+    #[test]
+    fn rejected_cancel_after_uncertain_stop_observes_ready_and_releases_owner() {
+        let mut control = SessionControl::default();
+        control.press("key:1", "dictation", "session");
+        control.release("key:1");
+        control.failure_cancel("session");
+        let reply = serde_json::json!({"accepted":false,"reason":"not_active","session_id":"session","state":"ready","busy":false,"result":{"text":"recoverable"}});
+        assert_eq!(
+            command_reply_decision("session", &reply),
+            CommandReplyDecision::Observe { terminal: true }
+        );
+        assert!(control.observe("session", &reply).unwrap().finished);
+        assert!(control.active.is_none());
+        assert!(control.failure_cancel("session").is_none());
+        assert_eq!(reply["result"]["text"], "recoverable");
+    }
+    #[test]
+    fn rejected_already_cancelled_busy_reply_observes_until_worker_finishes() {
+        let mut control = SessionControl::default();
+        control.press("key:1", "dictation", "session");
+        control.cancel();
+        let mut reply = serde_json::json!({"accepted":false,"reason":"not_active","session_id":"session","state":"cancelled","busy":true});
+        assert_eq!(
+            command_reply_decision("session", &reply),
+            CommandReplyDecision::Observe { terminal: true }
+        );
+        assert!(!control.observe("session", &reply).unwrap().finished);
+        assert!(control.active.is_some());
+        reply["busy"] = serde_json::json!(false);
+        assert_eq!(
+            command_reply_decision("session", &reply),
+            CommandReplyDecision::Observe { terminal: true }
+        );
+        assert!(control.observe("session", &reply).unwrap().finished);
+        assert!(control.active.is_none());
+    }
+    #[test]
+    fn dispatcher_lost_start_keeps_owner_through_idle_status_until_cancel_rejection() {
+        let mut c = SessionControl::default();
+        c.press("key:1", "dictation", "session");
+        let lost = c.settle_transport_failure("session");
+        assert!(lost.pending);
+        let cancel = lost.retry_cancel.unwrap();
+        let idle = serde_json::json!({"session_id":null,"state":"idle","busy":false});
+        let unknown = c.settle_status("session", &idle);
+        assert!(unknown.pending);
+        assert_eq!(
+            unknown.retry_cancel.unwrap().command_seq,
+            cancel.command_seq
+        );
+        assert!(c.press("key:2", "dictation", "second").is_none());
+        let rejected = serde_json::json!({"accepted":false,"reason":"stale_session","session_id":null,"state":"idle","busy":false});
+        let done = c.settle_command("session", &rejected);
+        assert!(done.rejected && !done.pending && done.retry_cancel.is_none());
+        assert!(c.active.is_none());
+        assert!(c.press("key:2", "dictation", "second").is_some());
+        // A late result from the cancelled generation cannot settle the new owner.
+        assert!(!c.settle_command("session", &rejected).pending);
+        assert_eq!(c.active.as_ref().unwrap().session_id, "second");
+    }
+    #[test]
+    fn dispatcher_lost_stop_then_rejected_cancel_preserves_ready_result() {
+        let mut c = SessionControl::default();
+        c.press("key:1", "dictation", "session");
+        c.release("key:1");
+        assert!(c.settle_transport_failure("session").retry_cancel.is_some());
+        let ready = serde_json::json!({"accepted":false,"reason":"not_active","session_id":"session","state":"ready","busy":false,"result":{"text":"recovered"}});
+        let done = c.settle_command("session", &ready);
+        assert!(!done.pending && done.retry_cancel.is_none());
+        assert_eq!(done.observation.unwrap().state, "ready");
+        assert!(c.active.is_none());
+        assert_eq!(ready["result"]["text"], "recovered");
+    }
+    #[test]
+    fn dispatcher_lost_cancel_and_transient_status_failure_eventually_settle() {
+        let mut c = SessionControl::default();
+        c.press("key:1", "dictation", "session");
+        c.release("key:1");
+        let cancel = c.cancel().unwrap();
+        assert_eq!(
+            c.settle_transport_failure("session")
+                .retry_cancel
+                .unwrap()
+                .command_seq,
+            cancel.command_seq
+        );
+        let busy = serde_json::json!({"session_id":"session","state":"cancelled","busy":true});
+        let waiting = c.settle_status("session", &busy);
+        assert!(waiting.pending && waiting.retry_cancel.is_none());
+        assert!(c.settle_transport_failure("session").pending);
+        let recovered = c.settle_status("session", &busy);
+        assert!(recovered.pending && recovered.retry_cancel.is_none());
+        let idle = serde_json::json!({"session_id":"session","state":"cancelled","busy":false});
+        let done = c.settle_status("session", &idle);
+        assert!(!done.pending && done.retry_cancel.is_none());
+        assert!(c.active.is_none());
+    }
+    #[test]
+    fn in_flight_reply_from_restarted_engine_is_rejected_and_stale_request_never_sends() {
+        use std::cell::{Cell, RefCell};
+        let old = EngineIdentity {
+            engine_id: "old".into(),
+            token: "old-secret".into(),
+        };
+        let new = EngineIdentity {
+            engine_id: "new".into(),
+            token: "new-secret".into(),
+        };
+        let current = RefCell::new(Some(old.clone()));
+        let sends = Cell::new(0);
+        let reply =
+            serde_json::json!({"application_id":"wezza","protocol_version":1,"engine_id":"old"});
+        let result = tauri::async_runtime::block_on(owned_request(
+            &old,
+            || Ok(current.borrow().clone()),
+            async {
+                sends.set(sends.get() + 1);
+                *current.borrow_mut() = Some(new.clone());
+                Ok(reply.clone())
+            },
+        ));
+        assert!(result.is_err());
+        assert_eq!(sends.get(), 1);
+        let result = tauri::async_runtime::block_on(owned_request(
+            &old,
+            || Ok(current.borrow().clone()),
+            async {
+                sends.set(sends.get() + 1);
+                Ok(reply)
+            },
+        ));
+        assert!(result.is_err());
+        assert_eq!(sends.get(), 1);
+    }
+}
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct EngineIdentity {
+    pub token: String,
+    pub engine_id: String,
+}
+pub(super) fn validate_reply(
+    sent: &EngineIdentity,
+    current: Option<&EngineIdentity>,
+    reply: &serde_json::Value,
+) -> Result<(), String> {
+    if current != Some(sent) {
+        return Err("Engine instance changed; discarded stale response.".into());
+    }
+    if reply["application_id"] != "wezza"
+        || reply["protocol_version"] != 1
+        || reply["engine_id"] != sent.engine_id
+    {
+        return Err("Engine identity or protocol mismatch.".into());
+    }
+    Ok(())
+}
+#[derive(Clone)]
+pub(super) struct SessionCommand {
+    pub command_seq: u64,
+    pub session_id: String,
+    pub binding_id: String,
+    pub mode: String,
+    pub action: &'static str,
+}
+#[derive(Default)]
+pub(super) struct SessionControl {
+    pub active: Option<SessionCommand>,
+    seq: u64,
+    released: bool,
+    cancelled: bool,
+    cancel_command: Option<SessionCommand>,
+}
+impl SessionControl {
+    pub fn press(&mut self, binding: &str, mode: &str, id: &str) -> Option<SessionCommand> {
+        if self.active.is_some() {
+            return None;
+        }
+        self.seq += 1;
+        self.released = false;
+        self.cancelled = false;
+        self.cancel_command = None;
+        let command = SessionCommand {
+            command_seq: self.seq,
+            session_id: id.into(),
+            binding_id: binding.into(),
+            mode: mode.into(),
+            action: "start",
+        };
+        self.active = Some(command.clone());
+        Some(command)
+    }
+    fn command(&mut self, action: &'static str) -> Option<SessionCommand> {
+        let mut command = self.active.clone()?;
+        self.seq += 1;
+        command.command_seq = self.seq;
+        command.action = action;
+        Some(command)
+    }
+    pub fn release(&mut self, binding: &str) -> Option<SessionCommand> {
+        if self.active.as_ref()?.binding_id != binding || self.released || self.cancelled {
+            return None;
+        }
+        self.released = true;
+        self.command("stop")
+    }
+    pub fn cancel(&mut self) -> Option<SessionCommand> {
+        if self.cancelled {
+            return None;
+        }
+        self.cancelled = true;
+        let command = self.command("cancel");
+        self.cancel_command = command.clone();
+        command
+    }
+    pub fn finish(&mut self, id: &str) -> bool {
+        if self.active.as_ref().map(|c| c.session_id.as_str()) != Some(id) {
+            return false;
+        }
+        self.active = None;
+        true
+    }
+}
+
+pub(super) struct AcknowledgedState {
+    pub state: String,
+    pub mode: String,
+    pub finished: bool,
+}
+impl SessionControl {
+    pub fn observe(&mut self, id: &str, reply: &serde_json::Value) -> Option<AcknowledgedState> {
+        let active = self.active.as_ref()?;
+        if active.session_id != id || reply["session_id"].as_str() != Some(id) {
+            return None;
+        }
+        let state = reply["state"].as_str()?.to_string();
+        if !matches!(
+            state.as_str(),
+            "starting"
+                | "recording"
+                | "draining"
+                | "processing"
+                | "ready"
+                | "no_speech"
+                | "cancelled"
+                | "error"
+        ) {
+            return None;
+        }
+        let finished = matches!(
+            state.as_str(),
+            "ready" | "no_speech" | "cancelled" | "error"
+        ) && reply["busy"] == false;
+        let result = AcknowledgedState {
+            state,
+            mode: active.mode.clone(),
+            finished,
+        };
+        if finished {
+            self.finish(id);
+        }
+        Some(result)
+    }
+}
+pub(super) async fn owned_request<
+    F: std::future::Future<Output = Result<serde_json::Value, String>>,
+>(
+    identity: &EngineIdentity,
+    current: impl Fn() -> Result<Option<EngineIdentity>, String>,
+    send: F,
+) -> Result<serde_json::Value, String> {
+    if current()?.as_ref() != Some(identity) {
+        return Err("Engine instance changed before dispatch.".into());
+    }
+    let reply = send.await?;
+    validate_reply(identity, current()?.as_ref(), &reply)?;
+    Ok(reply)
+}
+
+impl SessionControl {
+    pub fn failure_cancel(&mut self, id: &str) -> Option<SessionCommand> {
+        if self.active.as_ref()?.session_id != id {
+            return None;
+        }
+        if let Some(command) = self.cancel_command.as_ref() {
+            return Some(command.clone());
+        }
+        self.cancel()
+    }
+}
+
+pub(super) fn protected_path(path: &str) -> Result<(), String> {
+    let route = path.split('?').next().unwrap_or("");
+    let normalized = route.to_ascii_lowercase();
+    if !route.starts_with('/')
+        || route.starts_with("//")
+        || path.contains(['\\', '#'])
+        || path.chars().any(char::is_control)
+        || route == "/health"
+        || route.split('/').any(|s| matches!(s, "." | ".."))
+        || ["%2e", "%2f", "%5c"].iter().any(|s| normalized.contains(s))
+    {
+        return Err("Invalid protected API path.".into());
+    }
+    Ok(())
+}
+
+pub(super) fn validate_handshake(reply: &serde_json::Value) -> Result<(), String> {
+    let Some(capabilities) = reply["capabilities"].as_array() else {
+        return Err("Engine handshake has no capabilities.".into());
+    };
+    if [
+        "serialized-sessions-v1",
+        "recoverable-results",
+        "insertion-disabled",
+    ]
+    .iter()
+    .any(|required| !capabilities.iter().any(|c| c.as_str() == Some(required)))
+    {
+        return Err("Engine does not support the required safe session protocol.".into());
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq)]
+pub(super) enum CommandReplyDecision {
+    Observe { terminal: bool },
+    Reject,
+    RetryCancel,
+}
+pub(super) fn command_reply_decision(id: &str, reply: &serde_json::Value) -> CommandReplyDecision {
+    let terminal = matches!(
+        reply["state"].as_str(),
+        Some("ready" | "no_speech" | "cancelled" | "error")
+    );
+    if reply["session_id"].as_str() == Some(id) && terminal {
+        return CommandReplyDecision::Observe { terminal: true };
+    }
+    if reply["accepted"] == false {
+        if reply["session_id"].as_str() != Some(id) {
+            CommandReplyDecision::Reject
+        } else {
+            CommandReplyDecision::RetryCancel
+        }
+    } else {
+        CommandReplyDecision::Observe { terminal: false }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct DispatchDecision {
+    pub observation: Option<AcknowledgedState>,
+    pub retry_cancel: Option<SessionCommand>,
+    pub pending: bool,
+    pub rejected: bool,
+}
+impl SessionControl {
+    fn owns(&self, id: &str) -> bool {
+        self.active.as_ref().map(|c| c.session_id.as_str()) == Some(id)
+    }
+    fn settle_observation(&mut self, id: &str, reply: &serde_json::Value) -> DispatchDecision {
+        let Some(observation) = self.observe(id, reply) else {
+            return self.settle_transport_failure(id);
+        };
+        let terminal = matches!(
+            observation.state.as_str(),
+            "ready" | "no_speech" | "cancelled" | "error"
+        );
+        DispatchDecision {
+            pending: !observation.finished,
+            retry_cancel: if terminal {
+                None
+            } else {
+                self.cancel_command.clone()
+            },
+            observation: Some(observation),
+            rejected: false,
+        }
+    }
+    pub fn settle_command(&mut self, id: &str, reply: &serde_json::Value) -> DispatchDecision {
+        if !self.owns(id) {
+            return DispatchDecision::default();
+        }
+        match command_reply_decision(id, reply) {
+            CommandReplyDecision::Observe { .. } => self.settle_observation(id, reply),
+            CommandReplyDecision::RetryCancel => self.settle_transport_failure(id),
+            CommandReplyDecision::Reject => {
+                self.finish(id);
+                DispatchDecision {
+                    rejected: true,
+                    ..Default::default()
+                }
+            }
+        }
+    }
+    pub fn settle_status(&mut self, id: &str, reply: &serde_json::Value) -> DispatchDecision {
+        if !self.owns(id) {
+            return DispatchDecision::default();
+        }
+        // A null/other session status is observational. An earlier request can
+        // still arrive, so retain ownership until cancellation is acknowledged.
+        self.settle_observation(id, reply)
+    }
+    pub fn settle_transport_failure(&mut self, id: &str) -> DispatchDecision {
+        if !self.owns(id) {
+            return DispatchDecision::default();
+        }
+        DispatchDecision {
+            pending: true,
+            retry_cancel: self.failure_cancel(id),
+            ..Default::default()
+        }
+    }
+}

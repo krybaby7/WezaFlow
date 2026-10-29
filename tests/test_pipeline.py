@@ -94,7 +94,7 @@ class PipelineOrchestratorTests(unittest.TestCase):
         self.assertEqual(result.raw_transcript, "hello world")
         self.assertEqual(result.polished_text, "polished: hello world")
         self.assertEqual(result.app_context.category, "code")
-        self.assertEqual(injector.injected, ["polished: hello world"])
+        self.assertEqual(injector.injected, [])
         self.assertEqual(formatter.calls[0][1].visible_text, [])
 
     def test_process_audio_uses_vocabulary_store_for_asr_prompt_and_formatter_hints(self):
@@ -157,7 +157,7 @@ class PipelineOrchestratorTests(unittest.TestCase):
 
         self.assertEqual(result.raw_transcript, "insert my email")
         self.assertEqual(result.polished_text, "user@example.com")
-        self.assertEqual(injector.injected, ["user@example.com"])
+        self.assertEqual(injector.injected, [])
 
     def test_process_audio_returns_no_speech_without_injection(self):
         from services.pipeline.orchestrator import PipelineOrchestrator
@@ -191,7 +191,7 @@ class PipelineOrchestratorTests(unittest.TestCase):
         result = pipeline.process_command("Selected text", [0.2, 0.4])
 
         self.assertEqual(result.polished_text, "Selected text [make concise]")
-        self.assertEqual(injector.injected, ["Selected text [make concise]"])
+        self.assertEqual(injector.injected, [])
 
 
 if __name__ == "__main__":

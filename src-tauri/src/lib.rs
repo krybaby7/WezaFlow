@@ -1,11 +1,10 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
     net::TcpStream,
     path::PathBuf,
     process::{Child, Command, Stdio},
     str::FromStr,
-    sync::Mutex,
+    sync::{mpsc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -25,10 +24,12 @@ const RECORDING_BAR_EVENT: &str = "recording-bar-state";
 const RECORDING_BAR_WIDTH: i32 = 300;
 const RECORDING_BAR_HEIGHT: i32 = 72;
 const RECORDING_BAR_BOTTOM_MARGIN: i32 = 72;
-const RECORDING_BAR_HIDE_DELAY: Duration = Duration::from_millis(700);
-const RECORDING_STATE_LISTENING: &str = "listening";
-const RECORDING_STATE_COMMAND: &str = "command";
-const RECORDING_STATE_ERROR: &str = "error";
+use session::{
+    owned_request, protected_path, validate_handshake, validate_reply, DispatchDecision,
+    EngineIdentity, SessionCommand, SessionControl,
+};
+#[cfg(not(windows))]
+use std::io::Read;
 
 #[cfg(windows)]
 use std::{
@@ -63,19 +64,26 @@ static MOUSE_HOOK_APP: OnceLock<AppHandle> = OnceLock::new();
 #[derive(Default)]
 struct DesktopState {
     runtime_process: Mutex<Option<Child>>,
+    engine_identity: Mutex<Option<EngineIdentity>>,
     hotkeys: Mutex<RegisteredHotkeys>,
     audio_ducking: Mutex<AudioDuckingState>,
     audio_ducking_settings: Mutex<AudioDuckingSettings>,
-    recording_mode: Mutex<Option<String>>,
+    commands: Mutex<ShellCommands>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Default)]
+struct ShellCommands {
+    control: SessionControl,
+    sender: Option<mpsc::Sender<(SessionCommand, EngineIdentity)>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct RegisteredHotkeys {
     dictation: HotkeyBindings,
     command_mode: HotkeyBindings,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct HotkeyBindings {
     keyboard: Vec<Shortcut>,
     mouse: Vec<MouseButtonBinding>,
@@ -96,24 +104,13 @@ pub struct HotkeySettings {
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct RuntimeStartRequest<'a> {
-    mode: &'a str,
-    language: Option<&'a str>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct RuntimeStopRequest<'a> {
-    language: Option<&'a str>,
-}
-
-#[derive(Clone, Debug, Serialize)]
 struct RecordingBarStatePayload {
     state: String,
     mode: String,
     message: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 struct AudioDuckingSettings {
     enabled: bool,
     target_volume: f32,
@@ -146,6 +143,7 @@ struct VolumeSnapshot {
 #[derive(Clone, Debug, Default)]
 struct AudioDuckingState {
     snapshot: Option<VolumeSnapshot>,
+    applied: Option<VolumeSnapshot>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -168,38 +166,41 @@ trait VolumeEndpoint {
 }
 
 #[tauri::command]
-fn start_runtime_process(app: AppHandle) -> Result<(), String> {
-    spawn_runtime_api(&app)
+async fn start_runtime_process(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || spawn_runtime_api(&app))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn stop_runtime_process(app: AppHandle) -> Result<(), String> {
-    restore_system_audio(&app);
-    let state = app.state::<DesktopState>();
-    if let Some(mut child) = state
-        .runtime_process
-        .lock()
-        .map_err(|err| err.to_string())?
-        .take()
-    {
-        let _ = child.kill();
-    }
-    Ok(())
+async fn stop_runtime_process(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || shutdown_runtime(&app))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-async fn runtime_status() -> Result<serde_json::Value, String> {
-    get_json("/status").await
+async fn runtime_request(
+    app: AppHandle,
+    method: String,
+    path: String,
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let identity = current_identity(&app)?;
+    authenticated_request(&app, &identity, &method, &path, body).await
 }
 
 #[tauri::command]
-async fn runtime_check() -> Result<serde_json::Value, String> {
-    get_json("/runtime/check").await
+async fn runtime_status(app: AppHandle) -> Result<serde_json::Value, String> {
+    runtime_request(app, "GET".into(), "/status".into(), None).await
 }
-
 #[tauri::command]
-async fn runtime_diagnostics() -> Result<serde_json::Value, String> {
-    get_json("/runtime/diagnostics").await
+async fn runtime_check(app: AppHandle) -> Result<serde_json::Value, String> {
+    runtime_request(app, "GET".into(), "/runtime/check".into(), None).await
+}
+#[tauri::command]
+async fn runtime_diagnostics(app: AppHandle) -> Result<serde_json::Value, String> {
+    runtime_request(app, "GET".into(), "/runtime/diagnostics".into(), None).await
 }
 
 #[tauri::command]
@@ -232,9 +233,13 @@ pub fn run() {
         )
         .setup(|app| {
             create_tray(app)?;
-            if let Err(err) = spawn_runtime_api(&app.handle()) {
-                eprintln!("WezaFlow could not start the Python runtime API: {err}");
-            }
+            start_command_dispatcher(app.handle().clone());
+            let handle = app.handle().clone();
+            thread::spawn(move || {
+                if let Err(err) = spawn_runtime_api(&handle) {
+                    eprintln!("Engine startup failed: {err}");
+                }
+            });
             start_mouse_button_listener(app.handle().clone());
             register_hotkeys_inner(
                 &app.handle(),
@@ -252,12 +257,18 @@ pub fn run() {
             runtime_check,
             runtime_diagnostics,
             runtime_status,
+            runtime_request,
             show_settings_window,
             start_runtime_process,
             stop_runtime_process
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running WezaFlow");
+        .build(tauri::generate_context!())
+        .expect("error while building WezaFlow")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                let _ = shutdown_runtime(app);
+            }
+        });
 }
 
 fn create_tray(app: &mut App) -> tauri::Result<()> {
@@ -288,14 +299,23 @@ fn create_tray(app: &mut App) -> tauri::Result<()> {
                 let _ = show_settings_window(app.clone());
             }
             "start_runtime" => {
-                let _ = start_runtime_process(app.clone());
+                let handle = app.clone();
+                thread::spawn(move || {
+                    let _ = spawn_runtime_api(&handle);
+                });
             }
             "stop_runtime" => {
-                let _ = stop_runtime_process(app.clone());
+                let handle = app.clone();
+                thread::spawn(move || {
+                    let _ = shutdown_runtime(&handle);
+                });
             }
             "quit" => {
-                let _ = stop_runtime_process(app.clone());
-                app.exit(0);
+                let handle = app.clone();
+                thread::spawn(move || {
+                    let _ = shutdown_runtime(&handle);
+                    handle.exit(0);
+                });
             }
             _ => {}
         })
@@ -312,11 +332,23 @@ fn handle_window_event(window: &Window, event: &WindowEvent) {
 }
 
 fn register_hotkeys_inner(app: &AppHandle, hotkeys: HotkeySettings) -> Result<(), String> {
-    let registered = parse_registered_hotkeys(hotkeys)?;
+    let state = app.state::<DesktopState>();
+    let commands = state.commands.lock().map_err(|e| e.to_string())?;
+    apply_hotkeys(app, hotkeys, commands.control.active.is_some())
+}
 
+fn apply_hotkeys(app: &AppHandle, hotkeys: HotkeySettings, active: bool) -> Result<(), String> {
+    let registered = parse_registered_hotkeys(hotkeys)?;
+    let state = app.state::<DesktopState>();
+    if *state.hotkeys.lock().map_err(|e| e.to_string())? == registered {
+        return Ok(());
+    }
+    if active {
+        return Err("Finish or cancel the active session before changing shortcuts.".into());
+    }
     app.global_shortcut()
         .unregister_all()
-        .map_err(|err| err.to_string())?;
+        .map_err(|e| e.to_string())?;
     for shortcut in registered
         .dictation
         .keyboard
@@ -325,11 +357,9 @@ fn register_hotkeys_inner(app: &AppHandle, hotkeys: HotkeySettings) -> Result<()
     {
         app.global_shortcut()
             .register(shortcut.clone())
-            .map_err(|err| err.to_string())?;
+            .map_err(|e| e.to_string())?;
     }
-
-    let state = app.state::<DesktopState>();
-    *state.hotkeys.lock().map_err(|err| err.to_string())? = registered;
+    *state.hotkeys.lock().map_err(|e| e.to_string())? = registered;
     Ok(())
 }
 
@@ -337,17 +367,23 @@ fn configure_desktop_settings_inner(
     app: &AppHandle,
     settings: DesktopSettings,
 ) -> Result<(), String> {
-    update_audio_ducking_settings(app, settings.runtime);
-    register_hotkeys_inner(app, settings.hotkeys)
-}
-
-fn update_audio_ducking_settings(app: &AppHandle, runtime: Option<DesktopRuntimeSettings>) {
-    let settings = runtime
+    let state = app.state::<DesktopState>();
+    let commands = state.commands.lock().map_err(|e| e.to_string())?;
+    let requested = settings
+        .runtime
         .map(AudioDuckingSettings::from_runtime_settings)
         .unwrap_or_default();
-    if let Ok(mut current) = app.state::<DesktopState>().audio_ducking_settings.lock() {
-        *current = settings;
+    let mut audio_settings = state
+        .audio_ducking_settings
+        .lock()
+        .map_err(|e| e.to_string())?;
+    let active = commands.control.active.is_some();
+    if active && *audio_settings != requested {
+        return Err("Finish or cancel the active session before changing audio settings.".into());
     }
+    apply_hotkeys(app, settings.hotkeys, active)?;
+    *audio_settings = requested;
+    Ok(())
 }
 
 fn handle_shortcut(
@@ -355,6 +391,12 @@ fn handle_shortcut(
     shortcut: &Shortcut,
     event: tauri_plugin_global_shortcut::ShortcutEvent,
 ) {
+    if *shortcut == Shortcut::new(None, Code::Escape) {
+        if event.state() == ShortcutState::Pressed {
+            enqueue_session_command(app, "", "", "cancel");
+        }
+        return;
+    }
     let state = app.state::<DesktopState>();
     let hotkeys = match state.hotkeys.lock() {
         Ok(hotkeys) => hotkeys.clone(),
@@ -382,8 +424,12 @@ fn handle_shortcut(
         return;
     };
     match event.state() {
-        ShortcutState::Pressed => start_runtime_mode(app, mode),
-        ShortcutState::Released => stop_runtime_mode(app),
+        ShortcutState::Pressed => {
+            enqueue_session_command(app, &format!("keyboard:{}", shortcut.id()), mode, "start")
+        }
+        ShortcutState::Released => {
+            enqueue_session_command(app, &format!("keyboard:{}", shortcut.id()), mode, "stop")
+        }
     }
 }
 
@@ -493,11 +539,16 @@ fn apply_audio_ducking<E: VolumeEndpoint>(
         return Ok(());
     }
 
-    state.snapshot = Some(VolumeSnapshot {
+    let snapshot = VolumeSnapshot {
         volume: current_volume,
         muted: current_muted,
-    });
+    };
     endpoint.set_volume(target)?;
+    state.snapshot = Some(snapshot);
+    state.applied = Some(VolumeSnapshot {
+        volume: target,
+        muted: current_muted,
+    });
     Ok(())
 }
 
@@ -508,6 +559,17 @@ fn restore_audio_ducking<E: VolumeEndpoint>(
     let Some(snapshot) = state.snapshot.take() else {
         return Ok(());
     };
+    let applied = state.applied.take();
+    let current = VolumeSnapshot {
+        volume: endpoint.get_volume()?,
+        muted: endpoint.get_muted()?,
+    };
+    if !applied
+        .map(|a| (a.volume - current.volume).abs() <= 0.0001 && a.muted == current.muted)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
     endpoint.set_volume(snapshot.volume.clamp(0.0, 1.0))?;
     endpoint.set_muted(snapshot.muted)?;
     Ok(())
@@ -795,85 +857,249 @@ fn hide_recording_bar(app: &AppHandle) {
     }
 }
 
-fn hide_recording_bar_after(app: AppHandle) {
-    thread::spawn(move || {
-        thread::sleep(RECORDING_BAR_HIDE_DELAY);
-        hide_recording_bar(&app);
-    });
-}
-
-fn set_active_recording_mode(app: &AppHandle, mode: &str) {
-    if let Ok(mut recording_mode) = app.state::<DesktopState>().recording_mode.lock() {
-        *recording_mode = Some(mode.to_string());
-    }
-}
-
-fn take_active_recording_mode(app: &AppHandle) -> String {
+fn current_identity(app: &AppHandle) -> Result<EngineIdentity, String> {
     app.state::<DesktopState>()
-        .recording_mode
+        .engine_identity
         .lock()
-        .ok()
-        .and_then(|mut mode| mode.take())
-        .unwrap_or_else(|| "dictation".to_string())
+        .map_err(|e| e.to_string())?
+        .clone()
+        .ok_or_else(|| "Engine is not ready.".into())
 }
 
-fn is_active_recording_mode(app: &AppHandle, expected_mode: &str) -> bool {
-    app.state::<DesktopState>()
-        .recording_mode
-        .lock()
-        .map(|mode| mode.as_deref() == Some(expected_mode))
-        .unwrap_or(false)
-}
-
-fn start_runtime_mode(app: &AppHandle, mode: &str) {
-    if mode == "dictation" {
-        duck_system_audio(app);
-    }
-    set_active_recording_mode(app, mode);
-    let recording_state = if mode == "command" {
-        RECORDING_STATE_COMMAND
-    } else {
-        RECORDING_STATE_LISTENING
+fn enqueue_session_command(app: &AppHandle, binding: &str, mode: &str, action: &str) {
+    let state = app.state::<DesktopState>();
+    let Ok(current) = state.engine_identity.lock() else {
+        return;
     };
-    show_recording_bar(app, recording_state, mode, None);
-    let app = app.clone();
-    let mode = mode.to_string();
-    tauri::async_runtime::spawn(async move {
-        if let Err(err) = post_json(
-            "/runtime/start",
-            &RuntimeStartRequest {
-                mode: &mode,
-                language: Some("en"),
-            },
-        )
-        .await
-        {
-            if !is_active_recording_mode(&app, &mode) {
+    let Some(identity) = current.as_ref().cloned() else {
+        return;
+    };
+    let Ok(mut commands) = state.commands.lock() else {
+        return;
+    };
+    let command = match action {
+        "start" => {
+            let Ok(id) = new_uuid() else {
+                return;
+            };
+            commands.control.press(binding, mode, &id)
+        }
+        "stop" => commands.control.release(binding),
+        "cancel" => commands.control.cancel(),
+        _ => None,
+    };
+    if let Some(command) = command {
+        if command.action == "start" {
+            let escape = Shortcut::new(None, Code::Escape);
+            if let Err(err) = app.global_shortcut().register(escape) {
+                commands.control.finish(&command.session_id);
+                show_recording_bar(
+                    app,
+                    "error",
+                    mode,
+                    Some(&format!("Cannot register cancellation key: {err}")),
+                );
                 return;
             }
-            show_recording_bar(&app, RECORDING_STATE_ERROR, &mode, Some(&err));
-            hide_recording_bar_after(app);
+        }
+        if commands
+            .sender
+            .as_ref()
+            .map(|s| s.send((command.clone(), identity)).is_ok())
+            != Some(true)
+        {
+            commands.control.finish(&command.session_id);
+            let _ = app
+                .global_shortcut()
+                .unregister(Shortcut::new(None, Code::Escape));
+            show_recording_bar(
+                app,
+                "error",
+                &command.mode,
+                Some("Engine command dispatcher unavailable."),
+            );
+        }
+    }
+}
+
+fn start_command_dispatcher(app: AppHandle) {
+    let (sender, receiver) = mpsc::channel::<(SessionCommand, EngineIdentity)>();
+    if let Ok(mut commands) = app.state::<DesktopState>().commands.lock() {
+        commands.sender = Some(sender);
+    }
+    thread::spawn(move || {
+        let mut observing: Option<(String, EngineIdentity)> = None;
+        let mut retry_cancel: Option<(SessionCommand, EngineIdentity)> = None;
+        loop {
+            match receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok((command, identity)) => {
+                    if command.action == "start" {
+                        // Wait behind startup without launching a replacement for an old queued press.
+                        let state = app.state::<DesktopState>();
+                        let _startup = state.runtime_process.lock();
+                    }
+                    let payload = serde_json::json!({"engine_id":identity.engine_id,"protocol_version":1,
+                        "session_id":command.session_id,"command_seq":command.command_seq,
+                        "binding_id":command.binding_id,"mode":command.mode,"language":null});
+                    let result = tauri::async_runtime::block_on(authenticated_request(
+                        &app,
+                        &identity,
+                        "POST",
+                        &format!("/runtime/{}", command.action),
+                        Some(payload),
+                    ));
+                    let decision = match result {
+                        Ok(reply) => {
+                            settle_runtime_reply(&app, &command.session_id, &identity, &reply, true)
+                        }
+                        Err(err) => session_failure(&app, &command.session_id, &identity, &err),
+                    };
+                    let (watch, retry) = dispatch_watch(decision, &command.session_id, &identity);
+                    observing = watch;
+                    retry_cancel = retry;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some((id, identity)) = observing.clone() {
+                        // Observe on every retry turn. Cancellation retries never
+                        // starve status, and mismatched status never discards them.
+                        let decision = match tauri::async_runtime::block_on(authenticated_request(
+                            &app, &identity, "GET", "/status", None,
+                        )) {
+                            Ok(reply) => settle_runtime_reply(&app, &id, &identity, &reply, false),
+                            Err(err) => session_failure(&app, &id, &identity, &err),
+                        };
+                        let (watch, retry) = dispatch_watch(decision, &id, &identity);
+                        observing = watch;
+                        retry_cancel = retry;
+                    }
+                    if let Some((command, identity)) = retry_cancel.take() {
+                        if let Ok(commands) = app.state::<DesktopState>().commands.lock() {
+                            if let Some(sender) = commands.sender.as_ref() {
+                                let _ = sender.send((command, identity));
+                            }
+                        }
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
         }
     });
 }
 
-fn stop_runtime_mode(app: &AppHandle) {
-    let _ = take_active_recording_mode(app);
-    hide_recording_bar(app);
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        if let Err(err) = post_json(
-            "/runtime/stop",
-            &RuntimeStopRequest {
-                language: Some("en"),
-            },
-        )
-        .await
-        {
-            eprintln!("WezaFlow could not stop recording cleanly: {err}");
+fn dispatch_watch(
+    decision: Option<DispatchDecision>,
+    id: &str,
+    identity: &EngineIdentity,
+) -> (
+    Option<(String, EngineIdentity)>,
+    Option<(SessionCommand, EngineIdentity)>,
+) {
+    let Some(decision) = decision else {
+        return (None, None);
+    };
+    (
+        decision.pending.then(|| (id.to_string(), identity.clone())),
+        decision
+            .retry_cancel
+            .map(|command| (command, identity.clone())),
+    )
+}
+
+fn session_failure(
+    app: &AppHandle,
+    id: &str,
+    identity: &EngineIdentity,
+    message: &str,
+) -> Option<DispatchDecision> {
+    let state = app.state::<DesktopState>();
+    let current = state.engine_identity.lock().ok()?;
+    if current.as_ref() != Some(identity) {
+        return None;
+    }
+    let mut commands = state.commands.lock().ok()?;
+    let mode = commands
+        .control
+        .active
+        .as_ref()
+        .filter(|c| c.session_id == id)
+        .map(|c| c.mode.clone());
+    let decision = commands.control.settle_transport_failure(id);
+    if let Some(mode) = mode {
+        restore_system_audio(app);
+        show_recording_bar(app, "error", &mode, Some(message));
+    }
+    Some(decision)
+}
+
+fn command_rejection_message(reason: Option<&str>) -> String {
+    match reason {
+        Some("command_editing_unavailable_until_M2") => {
+            "Command editing is unavailable during the safety rebuild.".into()
         }
-        restore_system_audio(&app);
-    });
+        Some("busy") => {
+            "The engine is finishing the previous session. Try again when it is ready.".into()
+        }
+        Some("shutting_down") => "The engine is shutting down.".into(),
+        Some("binding_mismatch") => "This shortcut does not own the active recording.".into(),
+        Some("unknown_session") => "This recording session is no longer active.".into(),
+        _ => "The engine could not accept this recording command.".into(),
+    }
+}
+
+fn settle_runtime_reply(
+    app: &AppHandle,
+    id: &str,
+    identity: &EngineIdentity,
+    reply: &serde_json::Value,
+    command: bool,
+) -> Option<DispatchDecision> {
+    let state = app.state::<DesktopState>();
+    let current = state.engine_identity.lock().ok()?;
+    if validate_reply(identity, current.as_ref(), reply).is_err() {
+        return None;
+    }
+    let mut commands = state.commands.lock().ok()?;
+    let mode = commands
+        .control
+        .active
+        .as_ref()
+        .filter(|c| c.session_id == id)
+        .map(|c| c.mode.clone());
+    let decision = if command {
+        commands.control.settle_command(id, reply)
+    } else {
+        commands.control.settle_status(id, reply)
+    };
+    if let Some(ack) = decision.observation.as_ref() {
+        if ack.state == "recording" && ack.mode == "dictation" {
+            duck_system_audio(app);
+        } else if ack.state != "starting" {
+            restore_system_audio(app);
+        }
+        show_recording_bar(app, &ack.state, &ack.mode, reply["last_error"].as_str());
+        if matches!(
+            ack.state.as_str(),
+            "ready" | "no_speech" | "cancelled" | "error"
+        ) {
+            let _ = app
+                .global_shortcut()
+                .unregister(Shortcut::new(None, Code::Escape));
+        }
+    } else if decision.rejected {
+        restore_system_audio(app);
+        let _ = app
+            .global_shortcut()
+            .unregister(Shortcut::new(None, Code::Escape));
+        if let Some(mode) = mode {
+            show_recording_bar(
+                app,
+                "error",
+                &mode,
+                Some(&command_rejection_message(reply["reason"].as_str())),
+            );
+        }
+    }
+    Some(decision)
 }
 
 fn handle_mouse_button(app: &AppHandle, button: MouseButtonBinding, pressed: bool) {
@@ -894,9 +1120,9 @@ fn handle_mouse_button(app: &AppHandle, button: MouseButtonBinding, pressed: boo
         return;
     };
     if pressed {
-        start_runtime_mode(app, mode);
+        enqueue_session_command(app, &format!("mouse:{button:?}"), mode, "start");
     } else {
-        stop_runtime_mode(app);
+        enqueue_session_command(app, &format!("mouse:{button:?}"), mode, "stop");
     }
 }
 
@@ -939,92 +1165,216 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, w_param: WPARAM, l_param: L
     CallNextHookEx(std::ptr::null_mut(), code, w_param, l_param)
 }
 
-async fn get_json(path: &str) -> Result<serde_json::Value, String> {
-    reqwest::Client::new()
-        .get(format!("{RUNTIME_BASE_URL}{path}"))
-        .send()
-        .await
-        .map_err(|err| err.to_string())?
-        .error_for_status()
-        .map_err(|err| err.to_string())?
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|err| err.to_string())
+async fn authenticated_request(
+    app: &AppHandle,
+    identity: &EngineIdentity,
+    method: &str,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    protected_path(path)?;
+    let method = match method {
+        "GET" => reqwest::Method::GET,
+        "POST" => reqwest::Method::POST,
+        "PUT" => reqwest::Method::PUT,
+        "DELETE" => reqwest::Method::DELETE,
+        "PATCH" => reqwest::Method::PATCH,
+        _ => return Err("Unsupported API method.".into()),
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .map_err(|e| e.to_string())?;
+    owned_request(
+        identity,
+        || {
+            app.state::<DesktopState>()
+                .engine_identity
+                .lock()
+                .map(|id| id.clone())
+                .map_err(|e| e.to_string())
+        },
+        async {
+            let mut request = client
+                .request(method, format!("{RUNTIME_BASE_URL}{path}"))
+                .bearer_auth(&identity.token);
+            if let Some(body) = body {
+                request = request.json(&body);
+            }
+            request
+                .send()
+                .await
+                .map_err(|e| e.to_string())?
+                .error_for_status()
+                .map_err(|e| e.to_string())?
+                .json::<serde_json::Value>()
+                .await
+                .map_err(|e| e.to_string())
+        },
+    )
+    .await
 }
 
-async fn post_json<T: Serialize + ?Sized>(
-    path: &str,
-    payload: &T,
-) -> Result<serde_json::Value, String> {
-    reqwest::Client::new()
-        .post(format!("{RUNTIME_BASE_URL}{path}"))
-        .json(payload)
-        .send()
-        .await
-        .map_err(|err| err.to_string())?
-        .error_for_status()
-        .map_err(|err| err.to_string())?
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|err| err.to_string())
+#[cfg(windows)]
+fn new_uuid() -> Result<String, String> {
+    unsafe {
+        windows::Win32::System::Com::CoCreateGuid()
+            .map(|id| format!("{id:?}").to_lowercase())
+            .map_err(|e| e.to_string())
+    }
+}
+#[cfg(not(windows))]
+fn new_uuid() -> Result<String, String> {
+    let mut bytes = [0u8; 16];
+    File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .map_err(|e| e.to_string())?;
+    bytes[6] = (bytes[6] & 15) | 64;
+    bytes[8] = (bytes[8] & 63) | 128;
+    let h = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &h[..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..]
+    ))
 }
 
 fn spawn_runtime_api(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<DesktopState>();
-    let mut runtime = state
-        .runtime_process
-        .lock()
-        .map_err(|err| err.to_string())?;
-
-    if runtime_api_is_compatible() {
-        return Ok(());
-    }
-
+    let mut runtime = state.runtime_process.lock().map_err(|e| e.to_string())?;
     if let Some(child) = runtime.as_mut() {
-        if child.try_wait().map_err(|err| err.to_string())?.is_none() {
-            wait_for_runtime_api(child, Duration::from_secs(3))?;
-            return Ok(());
+        if child.try_wait().map_err(|e| e.to_string())?.is_none() {
+            let identity = current_identity(app).map_err(|_| {
+                "An owned engine remains after failed cleanup. Stop it before restarting."
+                    .to_string()
+            })?;
+            let reply = tauri::async_runtime::block_on(authenticated_request(
+                app,
+                &identity,
+                "GET",
+                "/runtime/handshake",
+                None,
+            ))?;
+            return validate_handshake(&reply);
         }
         *runtime = None;
+        retire_engine(app, Some("Owned engine exited."))?;
     }
-
-    let root = project_root();
     if runtime_api_is_listening() {
-        terminate_recorded_runtime_process(&root);
-        wait_for_runtime_api_port_to_close(Duration::from_secs(2));
-        if runtime_api_is_listening() {
-            return Err(
-                "an incompatible LocalFlow runtime API is already using 127.0.0.1:8765".to_string(),
-            );
-        }
+        return Err(
+            "An unowned service is using 127.0.0.1:8765; refusing to adopt or terminate it.".into(),
+        );
     }
-
+    let root = project_root();
     if !is_project_root(&root) {
-        return Err(format!(
-            "could not find project root containing services/runtime/api.py from {}",
-            root.display()
-        ));
+        return Err("Could not find Python runtime project root.".into());
     }
-    let python = python_executable(&root);
-    let mut command = Command::new(python);
+    let identity = EngineIdentity {
+        engine_id: new_uuid()?,
+        token: format!("{}{}", new_uuid()?, new_uuid()?),
+    };
+    let mut command = Command::new(python_executable(&root));
     command
         .args(["-m", "services.runtime.api"])
-        .current_dir(&root);
-
-    if let Ok(log_file) = runtime_log_file(&root) {
-        if let Ok(stderr) = log_file.try_clone() {
-            command.stdout(Stdio::from(log_file));
-            command.stderr(Stdio::from(stderr));
+        .current_dir(&root)
+        .env("WEZZA_ENGINE_ID", &identity.engine_id)
+        .env("WEZZA_ENGINE_TOKEN", &identity.token);
+    if let Ok(log) = runtime_log_file(&root) {
+        if let Ok(stderr) = log.try_clone() {
+            command.stdout(Stdio::from(log)).stderr(Stdio::from(stderr));
         }
     }
-
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
+    // Store ownership before any readiness work that can fail.
+    *runtime = Some(command.spawn().map_err(|e| e.to_string())?);
+    *state.engine_identity.lock().map_err(|e| e.to_string())? = Some(identity.clone());
+    let result = wait_for_owned_runtime(
+        app,
+        runtime.as_mut().unwrap(),
+        &identity,
+        Duration::from_secs(8),
+    );
+    if result.is_err() {
+        retire_engine(app, Some("Owned engine startup failed."))?;
+        if let Err(cleanup) =
+            cleanup_owned_slot(&mut runtime, 0, || thread::sleep(Duration::from_millis(50)))
+        {
+            return Err(format!("{} Cleanup failed: {cleanup}", result.unwrap_err()));
+        }
+    }
+    result
+}
 
-    let mut child = command.spawn().map_err(|err| err.to_string())?;
-    wait_for_runtime_api(&mut child, Duration::from_secs(8))?;
-    record_runtime_pid(&root, child.id());
-    *runtime = Some(child);
+fn wait_for_owned_runtime(
+    app: &AppHandle,
+    child: &mut Child,
+    identity: &EngineIdentity,
+    timeout: Duration,
+) -> Result<(), String> {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            return Err(format!("Owned engine exited during startup: {status}"));
+        }
+        if let Ok(reply) = tauri::async_runtime::block_on(authenticated_request(
+            app,
+            identity,
+            "GET",
+            "/runtime/handshake",
+            None,
+        )) {
+            validate_handshake(&reply)?;
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err("Owned engine startup timed out; child was terminated and reaped.".into())
+}
+
+fn shutdown_runtime(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<DesktopState>();
+    let mut runtime = state.runtime_process.lock().map_err(|e| e.to_string())?;
+    if let Ok(identity) = current_identity(app) {
+        let _ = tauri::async_runtime::block_on(authenticated_request(
+            app,
+            &identity,
+            "POST",
+            "/runtime/shutdown",
+            Some(serde_json::json!({"engine_id":identity.engine_id,"protocol_version":1})),
+        ));
+    }
+    retire_engine(app, None)?;
+    cleanup_owned_slot(&mut runtime, 20, || {
+        thread::sleep(Duration::from_millis(50))
+    })
+}
+
+fn retire_engine(app: &AppHandle, message: Option<&str>) -> Result<(), String> {
+    let state = app.state::<DesktopState>();
+    let mut identity = state.engine_identity.lock().map_err(|e| e.to_string())?;
+    *identity = None;
+    let mut commands = state.commands.lock().map_err(|e| e.to_string())?;
+    let mode = commands
+        .control
+        .active
+        .take()
+        .map(|c| c.mode)
+        .unwrap_or_else(|| "dictation".into());
+    let _ = app
+        .global_shortcut()
+        .unregister(Shortcut::new(None, Code::Escape));
+    restore_system_audio(app);
+    if let Some(message) = message {
+        show_recording_bar(app, "error", &mode, Some(message));
+    } else {
+        hide_recording_bar(app);
+    }
     Ok(())
 }
 
@@ -1088,132 +1438,11 @@ fn runtime_log_file(root: &std::path::Path) -> Result<File, String> {
         .map_err(|err| err.to_string())
 }
 
-fn runtime_pid_file(root: &std::path::Path) -> PathBuf {
-    root.join("artifacts")
-        .join("logs")
-        .join("desktop-python-api.pid")
-}
-
-fn record_runtime_pid(root: &std::path::Path, pid: u32) {
-    let path = runtime_pid_file(root);
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let _ = fs::write(path, pid.to_string());
-}
-
-fn terminate_recorded_runtime_process(root: &std::path::Path) {
-    let Ok(pid_text) = fs::read_to_string(runtime_pid_file(root)) else {
-        return;
-    };
-    let Ok(pid) = pid_text.trim().parse::<u32>() else {
-        return;
-    };
-    terminate_process(pid);
-}
-
-fn terminate_process(pid: u32) {
-    #[cfg(windows)]
-    {
-        let mut command = Command::new("taskkill");
-        command.args(["/PID", &pid.to_string(), "/T", "/F"]);
-        command.creation_flags(CREATE_NO_WINDOW);
-        let _ = command.status();
-    }
-
-    #[cfg(not(windows))]
-    {
-        let _ = Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status();
-    }
-}
-
 fn runtime_api_is_listening() -> bool {
     let Ok(addr) = RUNTIME_SOCKET_ADDR.parse() else {
         return false;
     };
     TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok()
-}
-
-fn runtime_api_is_compatible() -> bool {
-    runtime_api_is_compatible_with(|path| runtime_api_path_is_ok(path, Duration::from_millis(600)))
-}
-
-fn runtime_api_is_compatible_with<F>(mut probe: F) -> bool
-where
-    F: FnMut(&str) -> bool,
-{
-    [
-        "/health",
-        "/runtime/capabilities",
-        "/corrections/pending",
-        "/learning/suggestions",
-    ]
-    .into_iter()
-    .all(|path| probe(path))
-}
-
-fn runtime_api_path_is_ok(path: &str, timeout: Duration) -> bool {
-    let Ok(addr) = RUNTIME_SOCKET_ADDR.parse() else {
-        return false;
-    };
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, timeout) else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
-    let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
-    if stream.write_all(request.as_bytes()).is_err() {
-        return false;
-    }
-
-    let mut response = String::new();
-    if stream.read_to_string(&mut response).is_err() {
-        return false;
-    }
-    runtime_api_response_is_ok(path, &response)
-}
-
-fn runtime_api_response_is_ok(path: &str, response: &str) -> bool {
-    let status_ok = response
-        .lines()
-        .next()
-        .map(|line| line.contains(" 200 "))
-        .unwrap_or(false);
-    if !status_ok {
-        return false;
-    }
-    if path == "/runtime/capabilities" {
-        return response.contains("\"runtime-warmup\"");
-    }
-    true
-}
-
-fn wait_for_runtime_api_port_to_close(timeout: Duration) {
-    let started = Instant::now();
-    while started.elapsed() < timeout {
-        if !runtime_api_is_listening() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
-fn wait_for_runtime_api(child: &mut Child, timeout: Duration) -> Result<(), String> {
-    let started = Instant::now();
-    while started.elapsed() < timeout {
-        if runtime_api_is_compatible() {
-            return Ok(());
-        }
-        if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
-            return Err(format!(
-                "Python runtime API exited during startup with status {status}. Check artifacts/logs/desktop-python-api.log."
-            ));
-        }
-        thread::sleep(Duration::from_millis(150));
-    }
-    Err("Python runtime API did not become ready before the startup timeout.".to_string())
 }
 
 fn python_executable(root: &PathBuf) -> PathBuf {
@@ -1387,36 +1616,248 @@ mod tests {
 
         assert!(endpoint.changes.is_empty());
     }
+}
 
+mod session;
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    struct Endpoint(f32, bool);
+    impl VolumeEndpoint for Endpoint {
+        fn get_volume(&mut self) -> Result<f32, String> {
+            Ok(self.0)
+        }
+        fn set_volume(&mut self, v: f32) -> Result<(), String> {
+            self.0 = v;
+            Ok(())
+        }
+        fn get_muted(&mut self) -> Result<bool, String> {
+            Ok(self.1)
+        }
+        fn set_muted(&mut self, v: bool) -> Result<(), String> {
+            self.1 = v;
+            Ok(())
+        }
+    }
     #[test]
-    fn runtime_compatibility_requires_current_api_surface() {
-        let mut probed_paths = Vec::new();
-
-        let compatible = runtime_api_is_compatible_with(|path| {
-            probed_paths.push(path.to_string());
-            path != "/corrections/pending"
+    fn preserves_user_volume_and_mute_changes() {
+        for user in [(0.4, false), (0.08, true)] {
+            let mut e = Endpoint(0.75, false);
+            let mut s = AudioDuckingState::default();
+            apply_audio_ducking(&mut e, AudioDuckingSettings::default(), &mut s).unwrap();
+            e.0 = user.0;
+            e.1 = user.1;
+            restore_audio_ducking(&mut e, &mut s).unwrap();
+            assert_eq!((e.0, e.1), user);
+        }
+    }
+}
+#[cfg(test)]
+mod child_tests {
+    use super::*;
+    #[derive(Default)]
+    struct FakeChild {
+        killed: usize,
+        reaped: usize,
+        exited: bool,
+        kill_fails: bool,
+        survives_kill: bool,
+    }
+    impl OwnedProcess for FakeChild {
+        fn exited(&mut self) -> Result<bool, String> {
+            Ok(self.exited)
+        }
+        fn kill_owned(&mut self) -> Result<(), String> {
+            self.killed += 1;
+            if self.kill_fails {
+                return Err("kill denied".into());
+            }
+            if !self.survives_kill {
+                self.exited = true;
+            }
+            Ok(())
+        }
+        fn reap(&mut self) -> Result<(), String> {
+            self.reaped += 1;
+            Ok(())
+        }
+    }
+    #[test]
+    fn startup_timeout_kills_and_reaps_only_owned_child() {
+        let mut owned = FakeChild::default();
+        let unrelated = FakeChild::default();
+        finish_owned_child(&mut owned, 0, || {}).unwrap();
+        assert_eq!((owned.killed, owned.reaped), (1, 1));
+        assert_eq!((unrelated.killed, unrelated.reaped), (0, 0));
+    }
+    #[test]
+    fn failed_kill_never_blocks_on_reap_and_retains_owned_handle() {
+        let mut slot = Some(FakeChild {
+            kill_fails: true,
+            ..Default::default()
         });
-
-        assert!(!compatible);
-        assert!(probed_paths.contains(&"/health".to_string()));
-        assert!(probed_paths.contains(&"/runtime/capabilities".to_string()));
-        assert!(probed_paths.contains(&"/corrections/pending".to_string()));
+        assert!(cleanup_owned_slot(&mut slot, 0, || {}).is_err());
+        let child = slot
+            .as_ref()
+            .expect("ownership must survive failed cleanup");
+        assert_eq!((child.killed, child.reaped), (1, 0));
     }
-
     #[test]
-    fn runtime_compatibility_accepts_all_required_paths() {
-        assert!(runtime_api_is_compatible_with(|_| true));
+    fn successful_kill_with_surviving_child_has_bounded_cleanup_and_keeps_handle() {
+        let mut slot = Some(FakeChild {
+            survives_kill: true,
+            ..Default::default()
+        });
+        let mut pauses = 0;
+        assert!(cleanup_owned_slot(&mut slot, 0, || {
+            pauses += 1;
+        })
+        .is_err());
+        assert!(pauses <= 20);
+        assert_eq!(slot.as_ref().unwrap().reaped, 0);
     }
-
     #[test]
-    fn runtime_capability_response_requires_warmup_capability() {
-        assert!(runtime_api_response_is_ok(
-            "/runtime/capabilities",
-            "HTTP/1.1 200 OK\r\n\r\n{\"capabilities\":[\"runtime-warmup\"]}"
+    fn graceful_exit_is_reaped_without_kill() {
+        let mut owned = FakeChild {
+            exited: true,
+            ..Default::default()
+        };
+        finish_owned_child(&mut owned, 2, || {}).unwrap();
+        assert_eq!((owned.killed, owned.reaped), (0, 1));
+    }
+}
+trait OwnedProcess {
+    fn exited(&mut self) -> Result<bool, String>;
+    fn kill_owned(&mut self) -> Result<(), String>;
+    fn reap(&mut self) -> Result<(), String>;
+}
+fn finish_owned_child<P: OwnedProcess>(
+    child: &mut P,
+    attempts: usize,
+    mut pause: impl FnMut(),
+) -> Result<(), String> {
+    for _ in 0..attempts {
+        if child.exited()? {
+            return child.reap();
+        }
+        pause();
+    }
+    if child.exited()? {
+        return child.reap();
+    }
+    if let Err(err) = child.kill_owned() {
+        // Natural exit can race kill. Never block on wait while it may still be alive.
+        if child.exited()? {
+            return child.reap();
+        }
+        return Err(format!(
+            "Could not terminate owned engine; retaining process handle: {err}"
         ));
-        assert!(!runtime_api_response_is_ok(
-            "/runtime/capabilities",
-            "HTTP/1.1 200 OK\r\n\r\n{\"capabilities\":[\"profile-session-refresh\"]}"
-        ));
+    }
+    for _ in 0..20 {
+        if child.exited()? {
+            return child.reap();
+        }
+        pause();
+    }
+    Err("Owned engine did not exit after termination; retaining process handle.".into())
+}
+impl OwnedProcess for Child {
+    fn exited(&mut self) -> Result<bool, String> {
+        self.try_wait()
+            .map(|s| s.is_some())
+            .map_err(|e| e.to_string())
+    }
+    fn kill_owned(&mut self) -> Result<(), String> {
+        self.kill().map_err(|e| e.to_string())
+    }
+    fn reap(&mut self) -> Result<(), String> {
+        self.wait().map(|_| ()).map_err(|e| e.to_string())
+    }
+}
+
+fn cleanup_owned_slot<P: OwnedProcess>(
+    slot: &mut Option<P>,
+    attempts: usize,
+    pause: impl FnMut(),
+) -> Result<(), String> {
+    let result = if let Some(child) = slot.as_mut() {
+        finish_owned_child(child, attempts, pause)
+    } else {
+        Ok(())
+    };
+    if result.is_ok() {
+        slot.take();
+    }
+    result
+}
+#[cfg(test)]
+mod dispatcher_watch_tests {
+    use super::*;
+    #[test]
+    fn lost_start_unknown_status_keeps_watch_and_cancel_until_definitive_rejection() {
+        let identity = EngineIdentity {
+            engine_id: "engine".into(),
+            token: "fake-secret".into(),
+        };
+        let mut control = SessionControl::default();
+        control.press("key:1", "dictation", "session");
+        let (watch, retry) = dispatch_watch(
+            Some(control.settle_transport_failure("session")),
+            "session",
+            &identity,
+        );
+        assert_eq!(watch.unwrap().0, "session");
+        let seq = retry.unwrap().0.command_seq;
+        let idle = serde_json::json!({"state":"idle","session_id":null,"busy":false});
+        let (watch, retry) = dispatch_watch(
+            Some(control.settle_status("session", &idle)),
+            "session",
+            &identity,
+        );
+        assert_eq!(watch.unwrap().0, "session");
+        assert_eq!(retry.unwrap().0.command_seq, seq);
+        let ack = serde_json::json!({"accepted":false,"reason":"stale_session","state":"idle","session_id":null,"busy":false});
+        let (watch, retry) = dispatch_watch(
+            Some(control.settle_command("session", &ack)),
+            "session",
+            &identity,
+        );
+        assert!(watch.is_none() && retry.is_none() && control.active.is_none());
+    }
+    #[test]
+    fn cancelled_busy_keeps_watch_without_retry_then_idle_finishes_watch() {
+        let identity = EngineIdentity {
+            engine_id: "engine".into(),
+            token: "fake-secret".into(),
+        };
+        let mut control = SessionControl::default();
+        control.press("key:1", "dictation", "session");
+        control.cancel();
+        let busy = serde_json::json!({"state":"cancelled","session_id":"session","busy":true});
+        for _ in 0..3 {
+            let (watch, retry) = dispatch_watch(
+                Some(control.settle_transport_failure("session")),
+                "session",
+                &identity,
+            );
+            assert!(watch.is_some() && retry.is_some());
+            let (watch, retry) = dispatch_watch(
+                Some(control.settle_status("session", &busy)),
+                "session",
+                &identity,
+            );
+            assert!(watch.is_some() && retry.is_none());
+        }
+        let done = serde_json::json!({"state":"cancelled","session_id":"session","busy":false});
+        let (watch, retry) = dispatch_watch(
+            Some(control.settle_status("session", &done)),
+            "session",
+            &identity,
+        );
+        assert!(watch.is_none() && retry.is_none() && control.active.is_none());
+        // The transport rejects an old reply after engine retirement before settlement.
+        let (watch, retry) = dispatch_watch(None, "session", &identity);
+        assert!(watch.is_none() && retry.is_none());
     }
 }

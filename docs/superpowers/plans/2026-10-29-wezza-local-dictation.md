@@ -140,21 +140,25 @@ Every package ends with parent-reviewed code, exact commands/output, and its acc
 
 **Owner:** one Sol across Rust/Python; do not split coupled lifecycle work. **Dependencies:** M0 technical baseline; user corpus collection may continue in parallel because lifecycle correctness is independently testable. **Findings:** F01-F03, F10-F11, F15, F17.
 
+**Implementation coordination update:** after defining the transport contract, the orchestrator assigned Python/React and Rust to two Sol implementers with disjoint file ownership. They deliver one integrated M1 slice, with parent-owned protocol decisions and independent HTTP-boundary, Rust, and frontend verification. No Terra tasks or independent completion claims at this boundary. The agreed interface is the authenticated `runtime_request(method, path, body)` Tauri bridge; responses carry `application_id=wezza`, `protocol_version=1`, and per-run `engine_id`. Status distinguishes the active `session_id` from `result_session_id` of retained recovery text.
+
 **Modify:** `src-tauri/src/lib.rs`, `services/runtime/api.py`, `services/runtime/session.py`, `services/runtime/hotkeys.py`, `services/runtime/runner.py`, `services/pipeline/orchestrator.py`, `services/runtime/speculative.py`, `src/lib/api.ts`, `src/App.tsx`.
 
 **Create:** `src-tauri/src/dictation_controller.rs`, `services/runtime/controller.py`, `services/runtime/contracts.py`, `services/runtime/workers.py`, `tests/test_runtime_controller.py`, `tests/test_runtime_concurrency.py`.
 
-- [ ] Introduce typed session commands/outcomes and an immutable validated settings snapshot. Wire saved audio/VAD/model/injection settings to actual adapters; define profile precedence explicitly and test non-default values. Use automatic multilingual intent in the new contract; never hard-code English in shell requests.
-- [ ] Establish engine-instance identity, authenticated/versioned handshake, owned/adopted process semantics, startup-timeout child cleanup, and graceful cancellation/shutdown. Reject old-engine responses after restart and validate PID identity before termination.
-- [ ] Move lifecycle state to the single controller; keep inference outside its command queue. Serialize accepted start/stop/reset operations and make duplicate commands idempotent.
-- [ ] Make processing return a result without inserting. Add commit eligibility/cancellation generations and in-memory recovery UI from this slice. Keep automatic OS insertion disabled until M2's target-bound adapter passes; M1 ends at ready/recoverable output.
-- [ ] Make recorder startup transactional; every injected factory/start/stop failure closes acquired resources exactly once. Bind release to accepted initiating binding.
-- [ ] Disable current speculation. Track all workers across cancellation/shutdown; reject additional work explicitly while a noninterruptible cancelled job still owns the worker.
-- [ ] Render states from acknowledged controller events. Show processing/recoverable/error states after release, instead of hiding the bar while work continues. Restore ducked audio on every terminal/error/shutdown path without overwriting a later user volume change.
+- [x] Introduce typed session commands/outcomes and an immutable validated settings snapshot. Wire saved audio/VAD/model/injection settings to actual adapters; define profile precedence explicitly and test non-default values. Use automatic multilingual intent in the new contract; never hard-code English in shell requests.
+- [x] Establish engine-instance identity, authenticated/versioned handshake, owned/adopted process semantics, startup-timeout child cleanup, and graceful cancellation/shutdown. Reject old-engine responses after restart and validate PID identity before termination.
+- [x] Move lifecycle state to the single controller; keep inference outside its command queue. Serialize accepted start/stop/reset operations and make duplicate commands idempotent.
+- [x] Make processing return a result without inserting. Add commit eligibility/cancellation generations and in-memory recovery UI from this slice. Keep automatic OS insertion disabled until M2's target-bound adapter passes; M1 ends at ready/recoverable output.
+- [x] Make recorder startup transactional; every injected factory/start/stop failure closes acquired resources exactly once. Bind release to accepted initiating binding.
+- [x] Disable current speculation. Track all workers across cancellation/shutdown; reject additional work explicitly while a noninterruptible cancelled job still owns the worker.
+- [x] Render states from acknowledged controller events. Show processing/recoverable/error states after release, instead of hiding the bar while work continues. Restore ducked audio on every terminal/error/shutdown path without overwriting a later user volume change.
 
 **Checks:** barrier-controlled release-before-start, duplicate start/stop, concurrent first requests, settings+status during processing, cross-binding release, cancellation before commit, stale result/error/context arrival, injected capture failures, startup timeout with no surviving child, old-engine replies, and stale-PID identity mismatch. Run `.venv/Scripts/python.exe -m unittest discover -s tests -p 'test_runtime*.py' -v`, Rust controller tests, and `npm test`.
 
-**Exit:** 1,000 seeded lifecycle schedules pass; one microphone owner; no direct pipeline insertion; no stale commit; cancellation and recovery demonstrable in the UI.
+**Technical status:** implemented and independently reviewed; 251 Python, 32 frontend and 27 Rust tests pass. The real Python HTTP startup/shutdown smoke passes without capture/inference. See [progress and evidence](../../implementation-progress.md). Physical microphone/hotkey timing, native shell lifecycle faults and Windows volume restoration remain manual qualification gaps. Automatic insertion remains disabled.
+
+**Exit:** 1,000 seeded lifecycle schedules pass; one microphone owner; no direct pipeline insertion; no stale commit; cancellation and recovery demonstrable in the UI. Automated coverage passes; live qualification is not yet complete.
 
 ### M2 — Guarded Windows insertion and minimal target context (P0)
 
@@ -172,6 +176,8 @@ Every package ends with parent-reviewed code, exact commands/output, and its acc
 **Checks:** fake focus/selection/clipboard interleavings, including focus loss after preflight validation but before OS write; exact delivered text in the controlled fixture; manual Notepad/editor/browser/chat-compose matrix with 200 insertion trials. Run the full baseline suite after integration. Preflight checks alone do not prove the target-bound-write gate.
 
 **Exit:** zero wrong-target/duplicate paste; concurrent user clipboard copies preserved; unavailable verification remains labeled; all failures leave recoverable output. Full OS clipboard/UIA behavior requires live testing, not only mocks.
+
+**Adapter evidence to preserve during implementation:** Microsoft's [TextPattern documentation](https://learn.microsoft.com/en-us/dotnet/framework/ui-automation/ui-automation-textpattern-overview) describes a read-oriented API, not a general text insertion transaction. [EM_REPLACESEL](https://learn.microsoft.com/en-us/windows/win32/controls/em-replacesel) can address a native edit control, but [window handles can be recycled](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindow). Neither a successful preflight check nor a timed-out [SendMessageTimeout](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendmessagetimeoutw) establishes verified delivery. Therefore qualify support by actual control/adapter, retain uncertain results, and do not describe generic Ctrl+V as target-bound. Clipboard restoration must acquire the clipboard and recheck ownership before writing; [sequence numbers](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getclipboardsequencenumber) detect changes but delayed rendering complicates observation. These sources constrain the adapter design; they do not establish that Wezza has passed the insertion gate.
 
 ### M3 — Multilingual ASR, capture quality, and power experiment (P1)
 

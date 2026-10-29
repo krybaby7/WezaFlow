@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import secrets
+from copy import deepcopy
+from threading import Event, Thread, RLock
+
+from services.runtime.controller import SerializedSessionController, PROTOCOL_VERSION, validate_session_settings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -11,13 +17,8 @@ from services.config.settings import load_settings, save_settings as persist_set
 from services.pipeline.models import PipelineResult
 from services.runtime.runner import (
     DEFAULT_ASR_PROFILE,
-    CorrectionKeyObserver,
-    create_runtime_session,
-    create_selection_reader,
     dependency_readiness,
-    normalize_language_arg,
     summarize_runtime_log,
-    warm_pipeline_in_background,
 )
 from services.snippets.store import delete_snippet, list_snippets, upsert_snippet
 from services.vocabulary.store import VocabularyStore
@@ -26,9 +27,10 @@ from services.vocabulary.store import VocabularyStore
 FindSpec = Callable[[str], Any]
 
 RUNTIME_API_CAPABILITIES = (
-    "profile-session-refresh",
+    "serialized-sessions-v1",
     "configured-runtime-diagnostics",
-    "runtime-warmup",
+    "recoverable-results",
+    "insertion-disabled",
 )
 
 
@@ -41,9 +43,6 @@ class RuntimeApiState:
     profile: str = DEFAULT_ASR_PROFILE
     quiet_mode: bool = False
     quality_fallback: bool = False
-    active_mode: str = "idle"
-    correction_observer: Any | None = None
-    pending_session_reset: bool = False
 
     @property
     def settings_path(self) -> Path:
@@ -63,32 +62,10 @@ class RuntimeApiState:
         return settings
 
     def save_runtime_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
-        previous_config = _runtime_session_config(load_settings(self.settings_path))
         saved = persist_settings(self.settings_path, settings)
-        next_config = _runtime_session_config(saved)
         self._apply_runtime_settings(saved)
-        if next_config != previous_config:
-            self.request_session_reset()
+        # Active settings snapshots are owned by SerializedSessionController.
         return saved
-
-    def request_session_reset(self) -> None:
-        if self.session is None:
-            self.pending_session_reset = False
-            return
-        if _state_value(getattr(self.session, "state", "idle")) == "recording":
-            self.pending_session_reset = True
-            return
-        self.reset_session()
-
-    def reset_session(self) -> None:
-        if self.correction_observer is not None:
-            try:
-                self.correction_observer.stop()
-            except Exception:
-                pass
-        self.correction_observer = None
-        self.session = None
-        self.pending_session_reset = False
 
     def diagnostic_lines(self, *, limit: int = 100) -> list[str]:
         self.load_runtime_settings()
@@ -109,82 +86,14 @@ class RuntimeApiState:
             )
 
     def _runtime_summary_line(self) -> str:
-        try:
-            profile = resolve_asr_profile(self.profile)
-            model = profile.model_name
-            threads: int | str = profile.cpu_threads
-        except ValueError:
-            model = "unknown"
-            threads = "unknown"
+        effective = load_settings(self.settings_path)
+        model = effective["models"]["whisper"]
+        threads = effective["models"]["whisper_cpu_threads"]
         return (
             f"Configured runtime: profile={self.profile} model={model} "
             f"threads={threads} quiet={self.quiet_mode}"
         )
 
-    def ensure_session(self) -> Any:
-        if self.session is not None:
-            if (
-                self.pending_session_reset
-                and _state_value(getattr(self.session, "state", "idle")) != "recording"
-            ):
-                self.reset_session()
-            else:
-                return self.session
-
-        settings = self.load_runtime_settings()
-        runtime = settings.get("runtime", {}) if isinstance(settings.get("runtime"), dict) else {}
-        self.session = create_runtime_session(
-            root=self.root,
-            use_ollama=bool(runtime.get("use_ollama", False)),
-            logger_path=self.log_path,
-            asr_profile=self.profile,
-            quiet_mode=self.quiet_mode,
-            quality_fallback=self.quality_fallback,
-            selection_reader=_optional_selection_reader(),
-        )
-        self.correction_observer = _optional_correction_observer(self.session)
-        self.warm_session(settings)
-        return self.session
-
-    def warm_session(self, settings: dict[str, Any] | None = None) -> None:
-        if self.session is None:
-            return
-        settings = settings or self.load_runtime_settings()
-        runtime = settings.get("runtime", {}) if isinstance(settings.get("runtime"), dict) else {}
-        language = normalize_language_arg(runtime.get("language"))
-        logger = getattr(self.session, "logger", None)
-        if logger is None:
-            return
-        pipeline = getattr(self.session, "pipeline", None)
-        if pipeline is not None:
-            warm_pipeline_in_background(pipeline, logger, language=language, role="main")
-        speculative_pipeline = getattr(self.session, "speculative_pipeline", None)
-        if speculative_pipeline is not None:
-            warm_pipeline_in_background(
-                speculative_pipeline,
-                logger,
-                language=language,
-                role="speculative",
-            )
-
-    def envelope(self) -> dict[str, Any]:
-        self.load_runtime_settings()
-        state = _state_value(getattr(self.session, "state", "idle")) if self.session else "idle"
-        if self.pending_session_reset and state != "recording":
-            self.reset_session()
-            state = "idle"
-        if state != "recording":
-            self.active_mode = "idle"
-        last_error = getattr(self.session, "last_error", None) if self.session else None
-        return {
-            "status": "ok",
-            "state": state,
-            "mode": self.active_mode,
-            "profile": self.profile,
-            "quiet_mode": self.quiet_mode,
-            "quality_fallback": self.quality_fallback,
-            "last_error": str(last_error) if last_error else None,
-        }
 
 
 def create_app(
@@ -193,10 +102,12 @@ def create_app(
     session: Any | None = None,
     log_path: str | Path | None = None,
     find_spec: FindSpec = importlib.util.find_spec,
+    engine_token: str | None = None,
+    engine_id: str | None = None,
+    controller_factory: Callable | None = None,
 ):
     try:
         from fastapi import FastAPI, HTTPException, Query
-        from fastapi.middleware.cors import CORSMiddleware
     except ImportError as exc:
         raise RuntimeError("fastapi is required to run the LocalFlow runtime API") from exc
 
@@ -207,54 +118,69 @@ def create_app(
         find_spec=find_spec,
         session=session,
     )
-    app = FastAPI(title="LocalFlow Runtime API", version="0.1.0")
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origin_regex=(
-            r"^(https?://tauri\.localhost|tauri://localhost|"
-            r"http://localhost(:\d+)?|http://127\.0\.0\.1(:\d+)?)$"
-        ),
-        allow_credentials=False,
-        allow_methods=["*"],
-        allow_headers=["*"],
+    token = engine_token or os.environ.get("WEZZA_ENGINE_TOKEN")
+    instance_id = engine_id or os.environ.get("WEZZA_ENGINE_ID")
+    if not token or not instance_id:
+        raise RuntimeError("Explicit per-run engine credentials are required")
+    controller = SerializedSessionController(
+        factory=controller_factory or (lambda settings: _create_session_adapters(state, settings)),
+        settings_provider=lambda: load_settings(state.settings_path), engine_id=instance_id,
     )
+    identity = {"application_id": "wezza", "protocol_version": PROTOCOL_VERSION, "engine_id": instance_id}
+    app = FastAPI(title="LocalFlow Runtime API", version="0.1.0")
+    app.state.controller = controller
+    app.state.shutdown_requested = Event()
+
+    @app.middleware("http")
+    async def authenticate(request, call_next):
+        from starlette.responses import JSONResponse
+        if request.url.path != "/health":
+            supplied = request.headers.get("authorization", "")
+            if not secrets.compare_digest(supplied, f"Bearer {token}"):
+                return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        response = await call_next(request)
+        if request.url.path != "/health" and response.status_code < 400:
+            import json
+            body = b"".join([chunk async for chunk in response.body_iterator])
+            payload = json.loads(body)
+            if isinstance(payload, dict): payload.update(identity)
+            return JSONResponse(payload, status_code=response.status_code)
+        return response
+
+    settings_lock = RLock()
 
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    @app.get("/runtime/handshake")
+    def handshake() -> dict[str, Any]:
+        return {"status": "ok", **identity, "capabilities": ["serialized-sessions-v1", "recoverable-results", "insertion-disabled"]}
+
     @app.get("/status")
     def status() -> dict[str, Any]:
-        return state.envelope()
+        settings = controller.settings_snapshot()
+        runtime = settings.get("runtime", {})
+        return {**controller.snapshot(), "profile": runtime.get("profile", DEFAULT_ASR_PROFILE),
+                "quiet_mode": runtime.get("quiet_mode", False), "quality_fallback": False}
 
     @app.post("/runtime/start")
     def start_runtime(payload: dict[str, Any]) -> dict[str, Any]:
-        mode = str(payload.get("mode", "dictation") or "dictation")
-        language = normalize_language_arg(payload.get("language"))
-        session_obj = state.ensure_session()
-        if mode == "command":
-            started = session_obj.start_command_recording(language=language)
-        elif mode == "dictation":
-            started = session_obj.start_recording(language=language)
-        else:
-            raise HTTPException(status_code=400, detail="mode must be dictation or command")
-        if started:
-            state.active_mode = mode
-        return state.envelope()
+        return controller.command("start", payload)
 
     @app.post("/runtime/stop")
-    def stop_runtime(payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        language = normalize_language_arg((payload or {}).get("language"))
-        result = state.ensure_session().stop_and_process(language=language)
-        response = state.envelope()
-        response["result"] = _serialize_result(result)
-        return response
+    def stop_runtime(payload: dict[str, Any]) -> dict[str, Any]:
+        return controller.command("stop", payload)
 
     @app.post("/runtime/cancel")
-    def cancel_runtime() -> dict[str, Any]:
-        state.ensure_session().cancel()
-        state.active_mode = "idle"
-        return state.envelope()
+    def cancel_runtime(payload: dict[str, Any]) -> dict[str, Any]:
+        return controller.command("cancel", payload)
+
+    @app.post("/runtime/shutdown")
+    def shutdown_runtime() -> dict[str, Any]:
+        controller.close()
+        app.state.shutdown_requested.set()
+        return {"status": "ok", **identity}
 
     @app.get("/runtime/check")
     def check_runtime() -> dict[str, Any]:
@@ -277,26 +203,53 @@ def create_app(
 
     @app.post("/runtime/warmup")
     def runtime_warmup() -> dict[str, Any]:
-        state.ensure_session()
-        return state.envelope()
+        raise HTTPException(status_code=409, detail="Warmup is unavailable during the safety rebuild")
 
     @app.get("/runtime/diagnostics")
     def runtime_diagnostics(limit: int = 100) -> dict[str, Any]:
-        return {
-            "status": "ok",
-            "lines": state.diagnostic_lines(limit=limit),
-        }
+        with settings_lock:
+            lines = state.diagnostic_lines(limit=limit)
+        snapshot = controller.snapshot()
+        active = snapshot.get("active_configuration")
+        if active:
+            lines.insert(1, f"Session snapshot: state={snapshot['state']} profile={active['profile']} model={active['model']} threads={active['cpu_threads']}; configured changes apply to the next session")
+        return {"status": "ok", "lines": lines}
 
     @app.get("/settings")
     def get_settings() -> dict[str, Any]:
-        return {"status": "ok", "settings": load_settings(state.settings_path)}
+        return {"status": "ok", "settings": controller.settings_snapshot()}
 
     @app.put("/settings")
     def put_settings(payload: dict[str, Any]) -> dict[str, Any]:
         settings = payload.get("settings")
         if not isinstance(settings, dict):
             raise HTTPException(status_code=400, detail="settings must be an object")
-        return {"status": "ok", "settings": state.save_runtime_settings(settings)}
+        try:
+            apply_profile = payload.get("apply_profile_defaults", False)
+            if not isinstance(apply_profile, bool):
+                raise ValueError("apply_profile_defaults must be a boolean")
+            if apply_profile:
+                settings = deepcopy(settings)
+                runtime = settings.get("runtime", {})
+                if not isinstance(runtime, dict):
+                    raise ValueError("runtime must be an object")
+                profile_name = runtime.get("profile")
+                if not isinstance(profile_name, str):
+                    raise ValueError("A selected profile is required to apply its defaults")
+                profile = resolve_asr_profile(profile_name)
+                models = settings.setdefault("models", {})
+                if not isinstance(models, dict):
+                    raise ValueError("models must be an object")
+                models.update(whisper=profile.model_name,
+                              whisper_compute_type=profile.compute_type,
+                              whisper_cpu_threads=profile.cpu_threads)
+            validate_session_settings(settings)
+            with settings_lock:
+                saved = persist_settings(state.settings_path, settings)
+                controller.update_settings(saved)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"status": "ok", "settings": saved}
 
     @app.get("/vocabulary/terms")
     def get_vocabulary_terms(limit: int | None = None) -> dict[str, Any]:
@@ -345,7 +298,7 @@ def create_app(
 
     @app.get("/corrections/pending")
     def get_pending_corrections() -> dict[str, Any]:
-        watcher = _correction_watcher(state)
+        watcher = None  # No insertion, therefore no automatic correction observation.
         if watcher is None or not hasattr(watcher, "list_pending"):
             return {"status": "ok", "pending": []}
         return {
@@ -357,7 +310,7 @@ def create_app(
 
     @app.post("/corrections/pending/{pending_id}/confirm")
     def confirm_pending_correction(pending_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        watcher = _correction_watcher(state)
+        watcher = None  # No insertion, therefore no automatic correction observation.
         if watcher is None or not hasattr(watcher, "confirm_pending"):
             raise HTTPException(status_code=404, detail="pending correction not found")
         if not _pending_correction_exists(watcher, pending_id):
@@ -378,7 +331,7 @@ def create_app(
 
     @app.post("/corrections/pending/{pending_id}/dismiss")
     def dismiss_pending_correction(pending_id: str) -> dict[str, Any]:
-        watcher = _correction_watcher(state)
+        watcher = None  # No insertion, therefore no automatic correction observation.
         if watcher is None or not hasattr(watcher, "dismiss_pending"):
             raise HTTPException(status_code=404, detail="pending correction not found")
         if not _pending_correction_exists(watcher, pending_id):
@@ -428,8 +381,7 @@ def _vocabulary_store(state: RuntimeApiState) -> VocabularyStore:
 
 
 def _correction_watcher(state: RuntimeApiState) -> Any | None:
-    session = state.ensure_session()
-    return getattr(session, "correction_watcher", None)
+    return None  # No inserted result exists in M1.
 
 
 def _runtime_session_config(settings: dict[str, Any]) -> tuple[str, bool, bool, bool]:
@@ -473,46 +425,39 @@ def _pending_correction_value(item: Any, key: str) -> Any:
     return getattr(item, key, None)
 
 
-def _optional_selection_reader() -> Callable[[], str] | None:
-    try:
-        return create_selection_reader()
-    except RuntimeError:
-        return None
-
-
-def _optional_correction_observer(session: Any) -> Any | None:
-    watcher = getattr(session, "correction_watcher", None)
-    if watcher is None:
-        return None
-    try:
-        observer = CorrectionKeyObserver(watcher)
-        observer.start()
-        return observer
-    except Exception:
-        return None
-
-
-def _serialize_result(result: PipelineResult | None) -> dict[str, Any]:
-    if result is None:
-        return {"status": "no_speech"}
-    payload = result.to_dict()
-    payload["status"] = "ok"
-    return payload
-
-
-def _state_value(value: Any) -> str:
-    if hasattr(value, "value"):
-        return str(value.value)
-    return str(value)
-
-
 def main() -> None:
     try:
         import uvicorn
     except ImportError as exc:
         raise RuntimeError("uvicorn is required to run the LocalFlow runtime API") from exc
 
-    uvicorn.run(create_app(), host="127.0.0.1", port=8765)
+    app = create_app()
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=8765))
+    def watch_shutdown():
+        app.state.shutdown_requested.wait()
+        server.should_exit = True
+    Thread(target=watch_shutdown, name="wezza-shutdown", daemon=True).start()
+    try:
+        server.run()
+    finally:
+        app.state.controller.close()
+        app.state.controller.wait_for_worker(2)
+
+
+
+
+def _create_session_adapters(state: RuntimeApiState, settings: dict):
+    from services.asr.audio_capture import AudioRecorder
+    from services.pipeline.factory import build_pipeline
+    runtime = settings.get("runtime", {})
+    profile = resolve_asr_profile(runtime.get("profile", DEFAULT_ASR_PROFILE))
+    pipeline = build_pipeline(root=state.root, settings=settings,
+                              use_ollama=bool(runtime.get("use_ollama", False)),
+                              quiet_mode=bool(runtime.get("quiet_mode", False)),
+                              **profile.pipeline_kwargs())
+    audio = settings["audio"]
+    recorder = AudioRecorder.microphone(sample_rate=audio["sample_rate"], blocksize=audio["blocksize"])
+    return recorder, pipeline
 
 
 if __name__ == "__main__":

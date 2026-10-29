@@ -17,10 +17,10 @@ The first implementation slice focuses on stable module boundaries:
 
 ## Windows
 
-Run the scaffold tests with:
+Run the tests with the project environment:
 
 ```powershell
-py -3 -m unittest discover -s tests -v
+./.venv/Scripts/python.exe -m unittest discover -s tests -v
 ```
 
 Build the Windows Tauri release with:
@@ -29,9 +29,23 @@ Build the Windows Tauri release with:
 npm run tauri -- build
 ```
 
+For development, run `npm run tauri -- dev`. The desktop shell starts and owns
+its authenticated local Python engine. `scripts/start_services.ps1` launches an
+existing release executable; rebuild it after source changes. Do not start a
+separate Python API before opening the desktop app.
+
+The local trilingual rebuild currently returns recoverable text with an explicit
+**Copy result** action. Automatic insertion, command editing, speculative
+processing, automatic warmup, and the legacy CLI capture path are unavailable
+while the new lifecycle and insertion adapters are qualified. Existing ASR
+profiles are English-only; multilingual recognition and grammar editing are
+still pending evaluation. See [implementation progress](docs/implementation-progress.md)
+and [speech collection instructions](docs/dictation-corpus-collection.md).
+
 ## macOS test build
 
-The macOS path is intended for developer testing from a GitHub checkout. It uses
+The macOS path has not been qualified for the current session rebuild. It is
+intended for developer testing from a GitHub checkout. It uses
 the same Tauri shell and Python runtime, with macOS-specific Command+C/Command+V
 text injection through `pyautogui`.
 

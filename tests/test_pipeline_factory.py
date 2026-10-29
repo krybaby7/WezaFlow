@@ -60,7 +60,7 @@ class PipelineFactoryTests(unittest.TestCase):
         result = pipeline.process_audio([0.1, 0.2])
 
         self.assertEqual(result.polished_text, "user@example.com")
-        self.assertEqual(injector.injected, ["user@example.com"])
+        self.assertEqual(injector.injected, [])
 
     def test_build_pipeline_wires_vocabulary_store_from_repo_db(self):
         from services.pipeline.factory import build_pipeline

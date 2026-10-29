@@ -48,7 +48,7 @@ import "./styles.css";
 export type RuntimeClient = {
   getStatus(): Promise<RuntimeStatus>;
   getSettings(): Promise<Settings>;
-  saveSettings(settings: Settings): Promise<Settings>;
+  saveSettings(settings: Settings, applyProfileDefaults?: boolean): Promise<Settings>;
   getDiagnostics(): Promise<string[]>;
   warmRuntime(): Promise<void>;
   checkRuntime(): Promise<DependencyStatus[]>;
@@ -92,7 +92,7 @@ const ASR_PROFILE_OPTIONS: AsrProfileOption[] = [
   { value: "low-impact", label: "low-impact", supportedLanguages: ["en"] },
   { value: "snappy", label: "snappy", supportedLanguages: ["en"] },
   { value: "balanced", label: "balanced", supportedLanguages: ["en"] },
-  { value: "quality", label: "quality" },
+  { value: "quality", label: "quality (English only)", supportedLanguages: ["en"] },
   { value: "distil-small-en", label: "distil-small-en", supportedLanguages: ["en"] }
 ];
 
@@ -108,10 +108,14 @@ const LANGUAGE_OPTIONS = [
 const DEFAULT_CLIENT = new RuntimeApiClient();
 
 const RECORDING_BAR_LABELS: Record<RecordingBarStatePayload["state"], string> = {
-  listening: "Listening",
-  command: "Command",
+  idle: "Idle",
+  starting: "Starting",
+  recording: "Listening",
+  draining: "Finishing recording",
   processing: "Processing",
-  done: "Done",
+  ready: "Ready to copy",
+  no_speech: "No speech",
+  cancelled: "Cancelled",
   error: "Error"
 };
 
@@ -171,7 +175,9 @@ function SettingsApp({ client = DEFAULT_CLIENT }: { client?: RuntimeClient }) {
   const [snippetExpansion, setSnippetExpansion] = useState("");
   const [message, setMessage] = useState("Loading runtime state...");
   const [error, setError] = useState<string | null>(null);
+  const [pendingDesktopSettings, setPendingDesktopSettings] = useState<Settings | null>(null);
   const promptedCorrectionId = useRef<string | null>(null);
+  const savedProfile = useRef<string | null>(null);
   const currentPendingCorrection = pendingCorrections[0] ?? null;
 
   const hotkeyValidation = useMemo(
@@ -189,9 +195,36 @@ function SettingsApp({ client = DEFAULT_CLIENT }: { client?: RuntimeClient }) {
   useEffect(() => {
     const poller = window.setInterval(() => {
       void refreshPendingCorrections();
+
     }, 2000);
     return () => window.clearInterval(poller);
   }, [client]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let active = false;
+    const poller = window.setInterval(async () => {
+      if (active) return;
+      active = true;
+      try {
+        const next = await client.getStatus();
+        if (!cancelled) setStatus(next);
+      } catch { /* Main refresh reports connection failures. */ }
+      finally { active = false; }
+    }, 500);
+    return () => { cancelled = true; window.clearInterval(poller); };
+  }, [client]);
+
+  useEffect(() => {
+    if (!pendingDesktopSettings || !status || status.busy || ["starting", "recording", "draining", "processing"].includes(status.state)) return;
+    const pending = pendingDesktopSettings;
+    setPendingDesktopSettings(null);
+    void configureDesktopSettings(pending).then(() => {
+      setMessage("Settings saved and desktop shortcuts applied");
+    }).catch(() => {
+      setError("Settings are saved for the next session. Finish recording, then save again to apply desktop shortcuts.");
+    });
+  }, [status?.state, status?.busy, pendingDesktopSettings]);
 
   async function refreshAll() {
     try {
@@ -219,6 +252,7 @@ function SettingsApp({ client = DEFAULT_CLIENT }: { client?: RuntimeClient }) {
       ]);
       setStatus(nextStatus);
       setSettings(nextSettings);
+      savedProfile.current = nextSettings.runtime.profile;
       setDiagnostics(nextDiagnostics);
       setDependencies(nextDependencies);
       setVocabulary(nextVocabulary);
@@ -226,20 +260,16 @@ function SettingsApp({ client = DEFAULT_CLIENT }: { client?: RuntimeClient }) {
       updatePendingCorrections(nextPendingCorrections);
       setLearningSuggestions(nextLearningSuggestions);
       setSnippets(nextSnippets);
-      await configureDesktopSettings(nextSettings);
-      void warmRuntime();
+      try {
+        await configureDesktopSettings(nextSettings);
+      } catch {
+        setPendingDesktopSettings(nextSettings);
+      }
+
       setMessage("Runtime API connected");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setMessage("Runtime API unavailable");
-    }
-  }
-
-  async function warmRuntime() {
-    try {
-      await client.warmRuntime();
-    } catch {
-      // Model warm-up is opportunistic; recording can still start if it fails.
     }
   }
 
@@ -274,17 +304,32 @@ function SettingsApp({ client = DEFAULT_CLIENT }: { client?: RuntimeClient }) {
       return;
     }
     const canonicalSettings = settingsForSave(settings);
-    const saved = await client.saveSettings(canonicalSettings);
+    const applyProfileDefaults = savedProfile.current !== null && canonicalSettings.runtime.profile !== savedProfile.current;
+    let saved: Settings;
+    try {
+      saved = await client.saveSettings(canonicalSettings, applyProfileDefaults);
+    } catch {
+      setError("Settings could not be saved. Your profile change is still pending; try saving again.");
+      return;
+    }
+    setError(null);
+    savedProfile.current = saved.runtime.profile;
     setSettings(saved);
-    await configureDesktopSettings(saved);
+    let desktopApplied = true;
+    try {
+      await configureDesktopSettings(saved);
+    } catch {
+      desktopApplied = false;
+      setPendingDesktopSettings(saved);
+    }
     const [nextStatus, nextDiagnostics] = await Promise.all([
       client.getStatus(),
       client.getDiagnostics()
     ]);
     setStatus(nextStatus);
     setDiagnostics(nextDiagnostics);
-    void warmRuntime();
-    setMessage("Settings saved");
+
+    setMessage(desktopApplied ? "Settings saved" : "Settings saved for the next session; desktop shortcuts will apply when recording finishes");
   }
 
   async function addVocabulary() {
@@ -453,11 +498,11 @@ function SettingsApp({ client = DEFAULT_CLIENT }: { client?: RuntimeClient }) {
 
 function RecordingFeedbackBar() {
   const [barState, setBarState] = useState<RecordingBarStatePayload>({
-    state: "listening",
+    state: "idle",
     mode: "dictation",
     message: null
   });
-  const isRecording = barState.state === "listening" || barState.state === "command";
+  const isRecording = barState.state === "recording";
 
   useEffect(() => {
     document.documentElement.classList.add("recording-bar-window");
@@ -484,7 +529,7 @@ function RecordingFeedbackBar() {
 
   const label = RECORDING_BAR_LABELS[barState.state];
   const statusMark =
-    barState.state === "done" ? "OK" : barState.state === "error" ? "!" : "ON";
+    barState.state === "ready" ? "OK" : barState.state === "error" ? "!" : "ON";
 
   return (
     <main className={`recording-bar-root state-${barState.state}`}>
@@ -595,6 +640,16 @@ function StatusPanel({
   dependencies: DependencyStatus[];
   diagnostics: string[];
 }) {
+  const [copyState, setCopyState] = useState("");
+  async function copyResult() {
+    if (!status?.result) return;
+    try {
+      await navigator.clipboard.writeText(status.result.polished_text);
+      setCopyState("Copied. Paste into your chosen field.");
+    } catch {
+      setCopyState("Copy unavailable. Select and copy the text below.");
+    }
+  }
   return (
     <div className="grid two">
       <div className="section">
@@ -607,8 +662,17 @@ function StatusPanel({
           <dt>Quiet mode</dt>
           <dd>{status?.quiet_mode ? "on" : "off"}</dd>
           <dt>Quality fallback</dt>
-          <dd>{status?.quality_fallback ? "on" : "off"}</dd>
+          <dd>Unavailable during the safety rebuild</dd>
         </dl>
+        {status?.last_error && <p role="alert">{status.last_error}</p>}
+        <p>Automatic insertion and command editing are unavailable during the safety rebuild.</p>
+        {status?.result && <section aria-label="Result recovery">
+          <h3>{status.result_session_id === status.session_id ? "Session result" : "Previous session result"}</h3>
+          <textarea aria-label="Recoverable dictation" readOnly value={status.result.polished_text} />
+          <details><summary>Raw transcript</summary><p>{status.result.raw_transcript}</p></details>
+          <button type="button" onClick={() => void copyResult()}>Copy result</button>
+          <p role="status">{copyState}</p>
+        </section>}
       </div>
       <div className="section">
         <h2>Checks</h2>
@@ -806,6 +870,7 @@ function DictationPanel({
   return (
     <div className="section">
       <h2>Dictation</h2>
+      <p>Command editing, automatic insertion, quality fallback, and background model warmup are unavailable during the safety rebuild. Current bundled profiles support English only.</p>
       <div className="grid two">
         <label>
           ASR profile
@@ -869,7 +934,8 @@ function DictationPanel({
         <label>
           <input
             type="checkbox"
-            checked={settings.runtime.quality_fallback ?? false}
+            disabled
+            checked={false}
             onChange={(event) =>
               onSettings({
                 ...settings,
@@ -877,7 +943,7 @@ function DictationPanel({
               })
             }
           />
-          Quality fallback
+          Quality fallback — unavailable during the safety rebuild
         </label>
       </div>
       <div className="audio-ducking">

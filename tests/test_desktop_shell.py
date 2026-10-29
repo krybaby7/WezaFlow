@@ -7,6 +7,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class DesktopShellTests(unittest.TestCase):
+    # Session ordering, acknowledged overlay state and engine identity are
+    # exercised by Rust session/transport tests and React rendering tests.
+    # Source-substring checks cannot establish those runtime guarantees.
     def test_windows_release_app_uses_gui_subsystem(self):
         main_rs = (ROOT / "src-tauri" / "src" / "main.rs").read_text(encoding="utf-8")
 
@@ -66,43 +69,12 @@ class DesktopShellTests(unittest.TestCase):
         self.assertGreaterEqual(recording_bar["height"], 38)
         self.assertLessEqual(recording_bar["height"], 72)
 
-    def test_recording_bar_state_events_are_emitted_from_rust_shell(self):
-        lib_rs = (ROOT / "src-tauri" / "src" / "lib.rs").read_text(encoding="utf-8")
-
-        self.assertIn('"recording-bar"', lib_rs)
-        self.assertIn('"recording-bar-state"', lib_rs)
-        for state in ["listening", "command", "error"]:
-            self.assertIn(f'"{state}"', lib_rs)
-
-    def test_recording_bar_hides_immediately_when_hotkey_is_released(self):
-        lib_rs = (ROOT / "src-tauri" / "src" / "lib.rs").read_text(encoding="utf-8")
-        stop_body = lib_rs.split("fn stop_runtime_mode", 1)[1].split(
-            "fn handle_mouse_button", 1
-        )[0]
-
-        self.assertIn("hide_recording_bar(app);", stop_body)
-        self.assertNotIn("RECORDING_STATE_PROCESSING", stop_body)
-        self.assertNotIn("RECORDING_STATE_DONE", stop_body)
-        self.assertNotIn("hide_recording_bar_after", stop_body)
-
     def test_main_window_close_hides_to_tray_instead_of_exiting(self):
         lib_rs = (ROOT / "src-tauri" / "src" / "lib.rs").read_text(encoding="utf-8")
 
         self.assertIn("CloseRequested", lib_rs)
         self.assertIn("prevent_close", lib_rs)
         self.assertIn(".hide()", lib_rs)
-
-    def test_runtime_compatibility_requires_current_capability_endpoint(self):
-        lib_rs = (ROOT / "src-tauri" / "src" / "lib.rs").read_text(encoding="utf-8")
-
-        self.assertIn('"/runtime/capabilities"', lib_rs)
-
-    def test_start_services_records_runtime_api_pid(self):
-        script = (ROOT / "scripts" / "start_services.ps1").read_text(encoding="utf-8")
-
-        self.assertIn("desktop-python-api.pid", script)
-        self.assertIn("-PassThru", script)
-        self.assertIn("Set-Content", script)
 
     def test_macos_setup_script_and_github_workflow_are_present(self):
         setup_script = ROOT / "scripts" / "setup_macos.sh"

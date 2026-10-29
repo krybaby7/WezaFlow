@@ -7,7 +7,7 @@ from typing import Any
 from services.asr.transcriber import Transcriber
 from services.asr.vad import VADFilter
 from services.common.paths import ProjectPaths
-from services.config.settings import load_default_settings
+from services.config.settings import load_settings
 from services.context.app_context import get_active_app_context
 from services.injection.clipboard import ClipboardInjector
 from services.llm.formatter import OllamaBackend, TextFormatter
@@ -32,10 +32,12 @@ def build_pipeline(
     whisper_cpu_threads: int | None = None,
     quiet_mode: bool = False,
     vocabulary_store: Any | None = None,
+    settings: Any | None = None,
 ) -> PipelineOrchestrator:
     repo_root = Path(root).resolve() if root is not None else ProjectPaths.discover().repo_root
     paths = ProjectPaths.from_repo_root(repo_root)
-    settings = load_default_settings()
+    supplied_settings = settings is not None
+    settings = settings if supplied_settings else load_settings(paths.config_dir / "settings.yaml")
 
     vad_settings = settings["vad"]
     audio_settings = settings["audio"]
@@ -57,19 +59,18 @@ def build_pipeline(
         trim_threshold=trim_threshold,
     )
     resolved_transcriber = transcriber or Transcriber(
-        model_name=whisper_model_name or model_settings["whisper"],
+        model_name=model_settings["whisper"] if supplied_settings else (whisper_model_name or model_settings["whisper"]),
         device="cpu",
-        compute_type=whisper_compute_type or model_settings["whisper_compute_type"],
-        cpu_threads=whisper_cpu_threads
-        if whisper_cpu_threads is not None
-        else model_settings["whisper_cpu_threads"],
+        compute_type=model_settings["whisper_compute_type"] if supplied_settings else (whisper_compute_type or model_settings["whisper_compute_type"]),
+        cpu_threads=model_settings["whisper_cpu_threads"] if supplied_settings or whisper_cpu_threads is None else whisper_cpu_threads,
+        local_files_only=True,
     )
     resolved_formatter = formatter or TextFormatter(
         backend=OllamaBackend(model=model_settings["ollama"]) if use_ollama else None
     )
-    resolved_context_provider = context_provider or get_active_app_context
+    resolved_context_provider = context_provider or (lambda: AppContext(app_name="unknown", window_title="", category="general"))
     resolved_injector = injector or ClipboardInjector(
-        preserve_previous_clipboard=True,
+        preserve_previous_clipboard=settings["injection"].get("preserve_previous_clipboard", True),
         paste_delay_seconds=settings["injection"]["paste_delay_ms"] / 1000,
     )
     resolved_snippets = snippets or SnippetEngine(
