@@ -1,6 +1,67 @@
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn recording_near_limit() -> serde_json::Value {
+        serde_json::json!({"session_id":"one","state":"recording","capture":{
+            "terminal_code":null,"sample_count":4_640_000,"max_samples":4_800_000,
+            "requested_sample_rate":16000,"actual_sample_rate":16000.0
+        }})
+    }
+    #[test]
+    fn recording_warning_begins_at_ten_seconds_remaining() {
+        let mut reply = recording_near_limit();
+        assert_eq!(runtime_message("one", &reply), Some("Recording ends soon."));
+        reply["capture"]["sample_count"] = serde_json::json!(4_639_999);
+        assert_eq!(runtime_message("one", &reply), None);
+        reply["capture"]["sample_count"] = serde_json::json!(4_799_999);
+        assert_eq!(runtime_message("one", &reply), Some("Recording ends soon."));
+    }
+    #[test]
+    fn recording_warning_rejects_stale_cancelled_or_faulted_capture() {
+        let mut reply = recording_near_limit();
+        assert_eq!(runtime_message("old", &reply), None);
+        reply["state"] = serde_json::json!("cancelled");
+        assert_eq!(runtime_message("one", &reply), None);
+        reply["state"] = serde_json::json!("recording");
+        reply["capture"]["terminal_code"] = serde_json::json!("input_overflow");
+        assert_eq!(runtime_message("one", &reply), None);
+        reply["last_error"] = serde_json::json!("Microphone failed");
+        assert_eq!(runtime_message("one", &reply), Some("Microphone failed"));
+    }
+    #[test]
+    fn recording_warning_requires_valid_known_capture_bounds_and_rates() {
+        for (field, invalid) in [
+            ("sample_count", serde_json::json!(-1)),
+            ("sample_count", serde_json::json!(4_800_000)),
+            ("sample_count", serde_json::json!(4_800_001)),
+            ("sample_count", serde_json::json!(4_640_000.5)),
+            ("max_samples", serde_json::json!(0)),
+            ("max_samples", serde_json::json!(4_800_001)),
+            ("requested_sample_rate", serde_json::json!(8000)),
+            ("actual_sample_rate", serde_json::json!(8000)),
+            ("actual_sample_rate", serde_json::Value::Null),
+            ("terminal_code", serde_json::json!(true)),
+        ] {
+            let mut reply = recording_near_limit();
+            reply["capture"][field] = invalid;
+            assert_eq!(runtime_message("one", &reply), None, "invalid {field}");
+        }
+        for field in ["sample_count", "max_samples", "requested_sample_rate", "actual_sample_rate", "terminal_code"] {
+            let mut reply = recording_near_limit();
+            reply["capture"].as_object_mut().unwrap().remove(field);
+            assert_eq!(runtime_message("one", &reply), None, "missing {field}");
+        }
+    }
+    #[test]
+    fn duration_terminal_keeps_post_limit_message_instead_of_advance_warning() {
+        let mut reply = recording_near_limit();
+        reply["capture"]["terminal_code"] = serde_json::json!("duration_limit");
+        assert_eq!(runtime_message("one", &reply), None);
+        for state in ["draining", "processing", "ready", "no_speech"] {
+            reply["state"] = serde_json::json!(state);
+            assert_eq!(runtime_message("one", &reply), Some("Five-minute limit reached."));
+        }
+    }
     #[test]
     fn automatic_capture_finish_releases_without_extra_stop() {
         let mut c = SessionControl::default();
@@ -527,8 +588,25 @@ pub(super) fn runtime_message<'a>(id: &str, reply: &'a serde_json::Value) -> Opt
     if let Some(error) = reply["last_error"].as_str() {
         return Some(error);
     }
-    if reply["session_id"].as_str() == Some(id)
-        && matches!(reply["state"].as_str(), Some("draining" | "processing" | "ready" | "no_speech"))
+    if reply["session_id"].as_str() != Some(id) {
+        return None;
+    }
+    let capture = &reply["capture"];
+    if reply["state"].as_str() == Some("recording")
+        && capture.get("terminal_code").is_some_and(serde_json::Value::is_null)
+        && capture["requested_sample_rate"].as_u64() == Some(16_000)
+        && capture["actual_sample_rate"].as_f64() == Some(16_000.0)
+    {
+        if let (Some(count), Some(cap)) = (
+            capture["sample_count"].as_u64(),
+            capture["max_samples"].as_u64(),
+        ) {
+            if count < cap && cap <= 4_800_000 && cap - count <= 160_000 {
+                return Some("Recording ends soon.");
+            }
+        }
+    }
+    if matches!(reply["state"].as_str(), Some("draining" | "processing" | "ready" | "no_speech"))
         && reply["capture"]["terminal_code"].as_str() == Some("duration_limit")
     {
         return Some("Five-minute limit reached.");
