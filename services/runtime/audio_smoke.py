@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -14,6 +15,8 @@ def record_wav(
     recorder_factory: Callable[[], AudioRecorder] = AudioRecorder.microphone,
     sleep: Callable[[float], None] = time.sleep,
 ) -> Path:
+    if not math.isfinite(seconds) or not 0 < seconds <= 120:
+        raise ValueError("seconds must be between 0 and 120")
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -28,8 +31,17 @@ def record_wav(
                 "microphone permissions/device availability."
             ) from exc
         sleep(seconds)
+        # Poll while the device is still running; stop clears the stream handle.
+        poll_status = getattr(recorder, "poll_capture_status", None)
+        if callable(poll_status):
+            poll_status()
         stop_attempted = True
         wav_bytes = recorder.stop()
+        # Drain callbacks can report a fault, so only the final status can admit audio.
+        # Older injected recorders need only implement start/stop.
+        status = getattr(recorder, "capture_status", None)
+        if status is not None and (status.terminal_code or status.cleanup_pending):
+            raise RuntimeError("Microphone capture failed; recording was not saved.")
     except BaseException:
         if not stop_attempted:
             try:

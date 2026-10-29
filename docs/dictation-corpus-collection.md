@@ -10,7 +10,7 @@ Run commands from the repository root with the project Python environment. All a
 ./.venv/Scripts/python.exe -m services.evaluation.collect record --collection artifacts/dictation-corpus/collection.json --id en-01 --seconds 8
 ```
 
-Read the displayed prompt before confirming. A quiet setting and a short pause before/after each sentence help. Record each ID separately. Existing recordings are never silently replaced; use a fresh collection directory for another take. `init` also refuses an existing collection. Record en-01 through en-10, fr-01 through fr-10, and ar-01 through ar-10. A failed take can be kept for inspection; this helper does not provide destructive replacement commands.
+Read the displayed prompt before confirming. A quiet setting and a short pause before/after each sentence help. Record each ID separately. Existing recordings are never silently replaced; use a fresh collection directory for another take. `init` also refuses an existing collection. Record en-01 through en-10, fr-01 through fr-10, and ar-01 through ar-10. A take with detected overflow, invalid audio, device/rate failure, a duration cap or pending cleanup is rejected; the collection's reserved output is removed and no audio/reference metadata is accepted. A technically successful but poorly spoken take can be kept for inspection; use a new collection for another take.
 
 Listen to each local `audio/<id>.wav`. Create a UTF-8 annotation JSON file outside the collection metadata file, with your manually checked verbatim reference and one or more acceptable final texts. The following is an **illustrative annotation shape**, not a reference for an unrecorded utterance:
 

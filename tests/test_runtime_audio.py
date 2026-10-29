@@ -138,6 +138,97 @@ class RuntimeAudioTests(unittest.TestCase):
 
 
 class RecordingCleanupTests(unittest.TestCase):
+    def test_invalid_duration_has_no_recorder_or_output_side_effects(self):
+        from services.runtime.audio_smoke import record_wav
+        for seconds in (0, -1, float('nan'), float('inf'), 120.01):
+            with self.subTest(seconds=seconds), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'nested' / 'test.wav'
+                calls = []
+                with self.assertRaises(ValueError):
+                    record_wav(path, seconds=seconds, recorder_factory=lambda: calls.append('created'))
+                self.assertEqual(calls, [])
+                self.assertFalse(path.parent.exists())
+
+    def test_real_recorder_faults_are_rejected_after_stream_drain(self):
+        from services.asr.audio_capture import AudioRecorder
+        from services.runtime.audio_smoke import record_wav
+        cases = ('overflow', 'invalid', 'drain_overflow', 'drain_invalid', 'rate', 'device', 'limit', 'success')
+        for fault in cases:
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                events = []
+                class Stream:
+                    samplerate = 8000 if fault == 'rate' else 16000
+                    active = fault != 'device'
+                    def __init__(self, callback):
+                        self.callback = callback
+                    def start(self):
+                        self.callback([float('nan') if fault == 'invalid' else .25],
+                                      status=fault == 'overflow')
+                    def stop(self):
+                        events.append('stop')
+                        self.callback([float('inf') if fault == 'drain_invalid' else .5],
+                                      status=fault == 'drain_overflow')
+                    def close(self):
+                        events.append('close')
+                recorder = AudioRecorder(stream_factory=lambda callback, *args: Stream(callback),
+                                         max_samples=1 if fault == 'limit' else 100)
+                path = Path(directory) / 'test.wav'
+                def run():
+                    return record_wav(path, seconds=.01, recorder_factory=lambda: recorder,
+                                      sleep=lambda seconds: events.append(seconds))
+                if fault == 'success':
+                    run()
+                    self.assertEqual(path.read_bytes(), AudioRecorder.float_samples_to_wav_bytes([.25, .5]))
+                else:
+                    with self.assertRaisesRegex(RuntimeError, 'Microphone capture failed'):
+                        run()
+                    self.assertFalse(path.exists())
+                self.assertEqual(events, [.01, 'stop', 'close'])
+
+    def test_final_status_rejects_pending_cleanup_without_leaking_diagnostics(self):
+        from services.asr.audio_capture import CaptureStatus
+        from services.runtime.audio_smoke import record_wav
+        class Recorder:
+            capture_status = CaptureStatus(None, 0, 1, 16000, None, True)
+            def start(self):
+                pass
+            def stop(self):
+                return b'RIFFbad'
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'test.wav'
+            with self.assertRaisesRegex(RuntimeError, '^Microphone capture failed; recording was not saved\\.$'):
+                record_wav(path, recorder_factory=Recorder, sleep=lambda seconds: None)
+            self.assertFalse(path.exists())
+
+    def test_collection_removes_reservation_after_real_capture_fault(self):
+        from services.asr.audio_capture import AudioRecorder
+        from services.evaluation import collect
+        from services.runtime.audio_smoke import record_wav
+        class Stream:
+            active = True
+            samplerate = 16000
+            def __init__(self, callback):
+                self.callback = callback
+            def start(self):
+                self.callback([.25])
+            def stop(self):
+                self.callback([.5], status=True)
+            def close(self):
+                pass
+        recorder = AudioRecorder(stream_factory=lambda callback, *args: Stream(callback))
+        with tempfile.TemporaryDirectory() as directory:
+            collection = collect.initialize(directory)
+            before = collection.read_bytes()
+            sid = json.loads(before)['samples'][0]['id']
+            def capture(path, *, seconds):
+                self.assertTrue(Path(path).exists())
+                return record_wav(path, seconds=seconds, recorder_factory=lambda: recorder,
+                                  sleep=lambda seconds: None)
+            with self.assertRaisesRegex(RuntimeError, 'Microphone capture failed'):
+                collect.record(collection, sid, .01, input_fn=lambda _: 'yes', recorder=capture)
+            self.assertFalse((Path(directory) / 'audio' / f'{sid}.wav').exists())
+            self.assertEqual(collection.read_bytes(), before)
+
     def test_interruptions_and_failures_cleanup_once_without_output(self):
         from services.runtime.audio_smoke import record_wav
         for stage in ('start', 'sleep', 'stop'):
