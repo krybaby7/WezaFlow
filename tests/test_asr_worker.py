@@ -50,12 +50,25 @@ class WorkerTests(unittest.TestCase):
     def test_failure_modes_reap_real_child(self):
         for mode in ('hung_start','die_start','hung_decode','die_decode','malformed','oversized','mismatch'):
             with self.subTest(mode=mode):
+                service = AsrWorkerService(_worker_target=fixture_worker)
+                self.addCleanup(service.close)
+                config = self.config(mode,startup_timeout_seconds=.6,decode_timeout_seconds=.3)
                 before = time.monotonic()
-                with self.assertRaises(AsrWorkerError):
-                    self.service.transcriber(self.config(mode,startup_timeout_seconds=.6,decode_timeout_seconds=.3)).transcribe(self.audio)
+                expected = 'worker_timeout' if mode in ('hung_start','hung_decode') else 'worker_protocol_error'
+                with self.assertRaisesRegex(AsrWorkerError,expected):
+                    service.transcriber(config).transcribe(self.audio)
                 self.assertLess(time.monotonic()-before,8)
-                self.assertFalse(self.service.snapshot()['owns_process'])
-                self.assertFalse(self.service.snapshot()['owns_io'])
+                self.assertFalse(service.snapshot()['owns_process'])
+                self.assertFalse(service.snapshot()['owns_io'])
+                if mode not in ('hung_start','die_start'):
+                    self.assertTrue((Path(config.snapshot)/'fixture-decode').is_file(), 'decode fault must receive request')
+
+    @unittest.skipUnless(__import__('os').name == 'nt','Windows spawn handle transfer')
+    def test_startup_timeout_before_child_unpickles_releases_ownership(self):
+        with self.assertRaisesRegex(AsrWorkerError,'worker_timeout'):
+            self.service.transcriber(self.config('hung_start',startup_timeout_seconds=.001)).transcribe(self.audio)
+        self.assertFalse(self.service.snapshot()['owns_process'])
+        self.assertFalse(self.service.snapshot()['owns_io'])
 
     def test_busy_and_close_interrupt(self):
         transcriber = self.service.transcriber(self.config('hung_decode',decode_timeout_seconds=30))

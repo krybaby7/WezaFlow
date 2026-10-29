@@ -277,6 +277,13 @@ class LifecycleTests(unittest.TestCase):
             time.sleep(.03)
         self.assertFalse(self.service.snapshot()['owns_process'])
 
+    def test_startup_timeout_before_child_unpickles_releases_ownership(self):
+        backend = self.service.backend(replace(self.config,startup_timeout=.001))
+        with self.assertRaisesRegex(RuntimeError,'local_operation_timeout'):
+            backend.edit(system_prompt='policy',user_payload='hello')
+        self.assertFalse(self.service.snapshot()['owns_process'])
+        self.assertFalse(self.service.snapshot()['owns_io'])
+
     def test_stalled_http_total_deadline_and_busy(self):
         backend = self.service.backend(self.config)
         backend.edit(system_prompt='policy',user_payload='hello')

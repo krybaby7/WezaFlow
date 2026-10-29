@@ -213,7 +213,8 @@ class LocalEditorService:
             gate = context.Event()
             self._connection = parent
             self._job = WorkerJob()
-            self._process = context.Process(target=child_main, args=(child,gate,config,self._generation), daemon=True)
+            from services.spawn_connection import child_connection
+            self._process = context.Process(target=child_main, args=(child_connection(child),gate,config,self._generation), daemon=True)
             self._process.start()
             child.close()
             self._job.assign(self._process)

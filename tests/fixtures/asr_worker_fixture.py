@@ -26,6 +26,7 @@ def fixture_worker(connection, config, identity, generation, runtime_hash):
         time.sleep(120)
     while True:
         request = receive(connection)
+        (Path(config.snapshot)/'fixture-decode').write_text('decode')
         if mode in ('decode_error','unsafe_error'):
             connection.send_bytes(encode({'op':'error','generation':generation,'identity':identity,'request':request['request'],'code':'decode_failed' if mode == 'decode_error' else 'unsafe user transcript'}))
             return

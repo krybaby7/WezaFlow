@@ -18,6 +18,7 @@ from services.pipeline.models import AsrResult
 from services.asr.local_artifacts import file_hash, validate_snapshot
 from services.asr.worker_process import worker_main, encode, receive
 from services.asr.windows_job import WorkerJob
+from services.spawn_connection import child_connection
 
 class AsrWorkerError(RuntimeError):
     """Sanitized machine-readable supervisor failure."""
@@ -224,7 +225,7 @@ class AsrWorkerService:
                 raise AsrWorkerError('worker_closed')
             parent, child = (self._connection_factory or multiprocessing.get_context('spawn').Pipe)()
             generation = uuid.uuid4().hex
-            process = multiprocessing.get_context('spawn').Process(target=self._target,args=(child,config,identity,generation,runtime_hash))
+            process = multiprocessing.get_context('spawn').Process(target=self._target,args=(child_connection(child),config,identity,generation,runtime_hash))
             self._connection,self._process,self._identity,self._generation = parent,process,identity,generation
             self._status = 'STARTING'
             self._provenance = None
