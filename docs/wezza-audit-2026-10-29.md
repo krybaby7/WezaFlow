@@ -107,3 +107,18 @@ Baseline tests do not verify real microphones, first/last syllable retention, Un
 | Local machine and CUDA discovery | Measured; model compatibility/inference untested |
 | Actual trilingual quality, grammar, smoothness, energy | Unresolved until corpus and live trials; cannot be inferred from tests |
 | Prioritized implementation and validation | Defined in companion plan; no implementation claimed |
+
+## Follow-up: native helper diagnostic evidence
+
+A bounded read-only REA follow-up inspected the same Windows 1.6.1297 helper, SHA256 `0846b760e72630e313a005be8410295adca45ff0aa365d3ff1d47a592a34387f` (20,704,120 bytes). Native decompilation providers were unavailable: Ghidra and IDA were unconfigured and Hopper was unsupported on this Windows host. No runtime attachment, process memory, private history, keyboard or clipboard operation was used.
+
+An ordinary reproducible UTF-16LE byte scan confirms that shipped diagnostics describe these mechanisms:
+
+| Artifact evidence (decimal file offsets) | Design implication | What it does not prove |
+|---|---|---|
+| Clipboard change suppresses restoration (18459116); previous snapshot discarded after a change (18459244); earlier paste restore superseded (18688340) | Track clipboard ownership and paste generation before restoration | Exact native sequencing, preserved formats or atomic ownership |
+| Delayed clipboard consumption (18459532); consumption timeout (18459396); delivered shortcut suppresses a duplicate fallback (18642740) | Model uncertain delivery and never automatically retry a possibly delivered paste | Timeout reliability or actual application compatibility |
+| Dictation-start focused element saved (18675156); focus-change failure (18838588); conditional refocus (18418380) | Capture the intended target at dictation start and correlate focus changes | An atomic target-bound write or universal mismatch rejection |
+| TextPattern readback falls back to ValuePattern (18717884); oversized contents skip verification (18471772); edit listener superseded by a newer paste (18498988) | Bound readback, keep verification outcomes distinct, correlate observations to the paste | ValuePattern-based insertion, exact-range proof or coverage in Codex/Claude/Comet |
+
+These are confirmed diagnostic **contents**, not demonstrated execution or reconstructed control flow. They strengthen the rationale for Wezza's session/transaction/clipboard design without establishing a race-free native writer. The existing JavaScript paste-ID and before/after verification findings remain the stronger control-flow evidence. The exact scan, strings and limitations are retained locally under ignored `artifacts/m2-native-evidence-2026-10-29/`. Implementation progress and later test results are recorded separately in `docs/implementation-progress.md`; the original audit baseline above remains historical.

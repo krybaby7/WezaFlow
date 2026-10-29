@@ -40,3 +40,34 @@ class WorkerJob:
             if not self.kernel.CloseHandle(self.handle):
                 raise RuntimeError('worker_job_close_failed')
             self.handle = None
+
+    def terminate(self):
+        """Terminate every descendant while retaining the job for reap proof."""
+        if self.handle is None:
+            return
+        import ctypes
+        from ctypes import wintypes
+        self.kernel.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        if not self.kernel.TerminateJobObject(self.handle, 1):
+            raise RuntimeError('worker_job_terminate_failed')
+
+    def wait_empty(self, timeout):
+        """True only when Windows reports no active processes in the job."""
+        if self.handle is None:
+            return False
+        import ctypes
+        import time
+        from ctypes import wintypes
+        class ACCOUNTING(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_int64) for name in ('user', 'kernel', 'period_user', 'period_kernel')] + [(name, wintypes.DWORD) for name in ('faults', 'total', 'active', 'terminated')]
+        self.kernel.QueryInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p]
+        deadline = time.monotonic() + timeout
+        while True:
+            info = ACCOUNTING()
+            if not self.kernel.QueryInformationJobObject(self.handle, 1, ctypes.byref(info), ctypes.sizeof(info), None):
+                raise RuntimeError('worker_job_query_failed')
+            if info.active == 0:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(min(.01, max(0, deadline-time.monotonic())))

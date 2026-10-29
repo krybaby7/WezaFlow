@@ -187,3 +187,59 @@ invalidate the backend. Load failures use `model_load_failed`; successful rows
 use `succeeded`. Progress still emits clip completion for unattempted rows with
 null inference time and `succeeded: false`; it emits no inference-start event for
 those rows. All selected clips remain visible regardless of backend availability.
+
+## Experimental local editor runtime
+
+`services.llm.local_worker` supplies an opt-in Windows backend for
+`ConstrainedEditor`. It is not wired into the normal dictation profile or the replay
+CLI, and no formatter candidate has passed the product language gates. A successful
+`edited` result means mechanical validation passed; it does not establish fidelity.
+Inspect raw and final text separately, especially negation, revisions and translation.
+
+Provision artifacts explicitly before execution. A UTF-8 JSON manifest uses
+`schema_version: 1`, bounded `source`/`revision` strings, `model`, `template`, `server`
+records and a `runtime_files` array. Every file record has a contained relative
+`path`, positive `bytes`, and lowercase `sha256`. Include the executable and required
+runtime DLLs. The child verifies actual bytes before launching; paths escaping the
+manifest directory, duplicate records and changed manifests are rejected. Source
+metadata identifies the distributor and revision; hashes alone do not establish quality.
+
+Use a saved Python entry point with the multiprocessing main guard:
+
+```python
+from pathlib import Path
+from services.llm.local_worker import LocalEditorConfig, LocalEditorService
+from services.llm.constrained_editor import ConstrainedEditor, EditRequest
+
+def main():
+    config = LocalEditorConfig(str(Path('artifacts/editor/manifest.json').resolve()))
+    service = LocalEditorService()
+    try:
+        editor = ConstrainedEditor(service.backend(config))
+        result = editor.edit(EditRequest('I I need the report.'))
+        # Keep result.raw, result.text, result.outcome and service.snapshot()
+        # in an explicitly chosen local evaluation report. Do not auto-paste.
+    finally:
+        if not service.close(timeout_seconds=5):
+            raise RuntimeError('Editor cleanup incomplete; ownership retained')
+
+if __name__ == '__main__':
+    import multiprocessing
+    multiprocessing.freeze_support()
+    main()
+```
+
+Default budgets are startup 120 s, request 15 s, idle retention 60 s and reap 5 s;
+the first two are experiment failure limits, not latency acceptance targets. Requests
+are serialized without a queue. The native runtime fixes context to 4096 tokens,
+output to 512 tokens and threads to two; oversized rendered requests are rejected
+instead of clipped. The supported template must hard-disable thinking and produce
+the checked empty thinking suffix. The manifest/model/template/runtime fingerprints
+and load/neutral-warmup durations are retained in the snapshot. Report first real
+request timing separately from neutral warmup and later cached-prompt requests.
+
+The service kills and verifies the complete assigned Windows job on cleanup. If the
+owner dies between wrapper creation and job assignment, the unopened gate bounds
+wrapper exit by startup timeout and no native model server is launched. Fixture
+tests exercise both windows. No offline network-denial or energy qualification is
+implied by binding the server to loopback and disabling proxies/redirects.
