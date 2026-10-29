@@ -1,8 +1,9 @@
-# Local dictation validation (M0)
+# Local dictation validation (M0 replay and M3 live ASR)
 
-This package evaluates supplied outputs without loading models, recording audio,
-reading UI context, pasting text, or making network requests. Live adapters belong
-to M3. Replay is not evidence of latency, power use, or real speech quality.
+The replay runner evaluates supplied outputs without loading models, recording
+audio, reading UI context, pasting text, or making network requests. The separate
+M3 live ASR runner is documented below. Replay is not evidence of latency, power
+use, or real speech quality.
 
 Run from the repository root with an explicitly selected split:
 
@@ -96,3 +97,93 @@ must follow their documented schemas. Arrays/scalars cannot substitute for a
 configuration object, including empty arrays. Non-finite JSON numbers (NaN,
 Infinity, and overflow such as 1e999) are rejected on read; configuration
 fingerprinting also rejects non-finite values supplied through the Python API.
+
+## Offline live ASR (M3)
+
+`services.evaluation.live` is separate from the replay runner. It loads one owned
+faster-whisper model from an explicitly selected absolute local snapshot and
+transcribes utterances sequentially. It never records audio, invokes the formatter,
+reads desktop context, inserts text, tunes parameters, or selects a winning model.
+For example (use your own absolute snapshot and consented manifest):
+
+```powershell
+./.venv/Scripts/python.exe -m services.evaluation.live --manifest local/manifest.json --split development --snapshot C:\absolute\model-snapshot --source owner/model --revision exact-revision --device cpu --compute-type int8 --cpu-threads 4 --output local/live-report.json
+```
+
+Every option shown except `--source` and `--revision` is required. Those two must
+be supplied together unless the path is an HF cache `models--owner--name/snapshots/`
+40-character commit directory, whose source/revision can be derived. Arbitrary
+local directories require caller-supplied provenance. File SHA256/size metadata
+binds the claim to the actual local artifacts; a caller revision label alone does
+not prove upstream authenticity. Required nonempty snapshot files are `model.bin`,
+`config.json`, `tokenizer.json`, `preprocessor_config.json`, and `vocabulary.json`.
+A comparator missing any required file is unavailable for this runner until an
+explicit complete local snapshot is supplied. There are no implicit downloads
+or remote tokenizer fallbacks; the backend receives `local_files_only=True`.
+
+The complete manifest and all its audio are validated before model construction,
+including entries outside the chosen split. WAV inputs use the existing benchmark
+contract: uncompressed PCM16, mono, exactly 16 kHz, with complete frame data. Audio
+checksums and manifest schema checks still apply. `heldout` must be explicitly
+selected and must not be used to choose settings. Historical English development
+clips can establish a mechanical smoke result, never fresh heldout or trilingual
+quality acceptance.
+
+Reports retain raw text, every yielded segment's start/end timestamps, detected
+language and available language probabilities (including unknown labels), audio
+duration, ASR Unicode scores, and failure rows including partial transcripts.
+Load failures produce a failed row for every selected sample. No transcript is
+translated or formatted. Exit codes are 0 for all successful rows, 1 for reported
+failures, and 2 for invalid inputs or report write errors.
+
+Model load is measured once, separately from each inference. Native lazy segment
+generation is exhausted inside the inference timer. The first row is `cold` for
+inference; a later row is `warm` only after an earlier inference completed. Failed
+partial decoding does not warm the run. `model_load_warmth: unknown_os_cache`
+explicitly declines to infer filesystem-cache warmth from successful loading.
+`queue_seconds` is zero because the runner submits one utterance at a time with
+no work queue; file decoding and float-array preparation precede inference timing.
+Per-row `model_load_seconds` repeats the shared load duration as provenance and
+must not be summed across rows. Snapshot hashing and full corpus validation are
+inside validation timing, before model load. CLI report writing is outside timers.
+
+CPU utilization, GPU memory, energy, and power are explicitly null with
+`resource_measurement_status: unavailable_not_instrumented`. Inference latency
+alone establishes no low-power or energy result. Installed faster-whisper, CTranslate2, and numpy versions are recorded without
+importing model code (a missing distribution is null). They are included in the
+configuration fingerprint, alongside whether the backend factory is native or injected.
+Each row records the actual `info.transcription_options` dataclass when provided by
+the backend, including beam size, temperature schedule, and previous-text conditioning.
+Its canonical JSON plus backend versions has an `effective_decode_fingerprint`;
+missing backend options are explicitly `unavailable_backend_did_not_report`, with
+null options/fingerprint. Unsupported non-JSON options are marked unavailable rather
+than fabricated. Native defaults are thereby auditable from actual effective options.
+Model/configuration and corpus hashes accompany every run; compare successful and failed rows together.
+Real consented French, Egyptian Arabic, and within-sentence mixed speech plus
+human-reviewed references remain required for the product quality gate.
+
+The configuration fingerprint includes the five model artifact SHA256 hashes and
+sizes, so replacing files at the same path/source/revision changes the fingerprint.
+Optional `--progress` writes flushed JSON events to stderr for validation, model
+loading, clip start, inference start, clip completion, and run completion. Events
+contain only phase, stable clip ID, elapsed/load/inference timings, and success
+status; they contain no audio, transcripts, references, or backend error messages.
+Default execution remains quiet. Python callers may pass `progress=callback` to
+`run_live` to receive those same dictionaries. Progress callbacks should return
+promptly; events are observations and provide no timeout or cancellation behavior.
+
+A backend exception after `transcribe` begins (including lazy segment iteration)
+invalidates that owned backend for the rest of the run. The current row retains
+partial text, segment metadata, scoring, duration, and its error with status
+`inference_failed`. Remaining selected rows stay in the failure denominator with
+status `not_attempted_backend_failed`, an explicit prior-backend-failure error,
+validated audio duration, and null inference time/raw score. The runner never
+retries that native instance after a decode failure: a missing CUDA DLL can leave
+native state unsafe for a second call. Fix the environment and launch a separate
+explicit run. This rule also applies to injected test backends.
+
+Failures before native inference starts use `pre_inference_failed` and do not
+invalidate the backend. Load failures use `model_load_failed`; successful rows
+use `succeeded`. Progress still emits clip completion for unattempted rows with
+null inference time and `succeeded: false`; it emits no inference-start event for
+those rows. All selected clips remain visible regardless of backend availability.
