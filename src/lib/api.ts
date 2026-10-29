@@ -10,6 +10,14 @@ export type CaptureStatus = {
 };
 
 export type RuntimeStatus = {
+  local_editor?: {
+    state: string;
+    busy: boolean;
+    last_error?: string | null;
+    configured_enabled?: boolean;
+    configuration_status?: string;
+  };
+  insertion_transaction?: {outcome?: string; state?: string} | null;
   capture?: CaptureStatus | null;
   asr_worker?: {
     state: string;
@@ -28,7 +36,7 @@ export type RuntimeStatus = {
   session_id?: string | null;
   result_session_id?: string | null;
   busy?: boolean;
-  result?: {raw_transcript: string; polished_text: string; diagnostics?: {capture?: CaptureStatus}} | null;
+  result?: {raw_transcript: string; polished_text: string; diagnostics?: {capture?: CaptureStatus; editing?: {outcome?: string; reason?: string}}} | null;
 };
 
 export type DependencyStatus = {
@@ -52,6 +60,7 @@ export type LocalAsrSettings = {
 
 export type Settings = {
   local_asr?: LocalAsrSettings;
+  local_editor?: LocalEditorSettings;
   hotkeys: {
     dictation: string | string[];
     command_mode: string | string[];
@@ -68,8 +77,21 @@ export type Settings = {
     system_audio_ducking: boolean;
     system_audio_duck_volume: number;
     use_ollama: boolean;
+    experimental_automatic_paste?: boolean;
   };
   [key: string]: unknown;
+};
+
+export type LocalEditorSettings = {
+  enabled: boolean;
+  manifest_path: string;
+  startup_timeout: number;
+  request_timeout: number;
+  idle_timeout: number;
+  reap_timeout: number;
+  threads: number;
+  context_tokens: number;
+  output_tokens: number;
 };
 
 export type VocabularyTerm = {

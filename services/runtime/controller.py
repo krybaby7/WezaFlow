@@ -361,6 +361,8 @@ def freeze_settings(value):
 def validate_session_settings(settings):
     if not isinstance(settings, dict):
         raise ValueError('Settings must be an object')
+    from services.runtime.local_editor import validate_editor_settings
+    validate_editor_settings(settings)
     for section in ('audio', 'vad', 'models', 'runtime', 'injection', 'local_asr'):
         if section in settings and not isinstance(settings[section], dict):
             raise ValueError(f'{section} must be an object')
@@ -381,6 +383,8 @@ def validate_session_settings(settings):
                 raise ValueError(f'{section}.{key} must be finite and nonnegative')
     from services.asr.profiles import resolve_asr_profile
     runtime = settings.get('runtime', {})
+    if type(runtime.get('experimental_automatic_paste', False)) is not bool:
+        raise ValueError('runtime.experimental_automatic_paste must be a boolean')
     profile = runtime.get('profile', 'low-impact')
     if not isinstance(profile, str): raise ValueError('Invalid profile')
     resolve_asr_profile(profile)

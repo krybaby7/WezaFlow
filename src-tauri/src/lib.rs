@@ -75,6 +75,8 @@ struct DesktopState {
 struct ShellCommands {
     control: SessionControl,
     sender: Option<mpsc::Sender<(SessionCommand, EngineIdentity)>>,
+    experimental_paste: bool,
+    paste_target: Option<windows_paste::Target>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -156,6 +158,7 @@ struct DesktopSettings {
 struct DesktopRuntimeSettings {
     system_audio_ducking: Option<bool>,
     system_audio_duck_volume: Option<u8>,
+    experimental_automatic_paste: Option<bool>,
 }
 
 trait VolumeEndpoint {
@@ -241,13 +244,8 @@ pub fn run() {
                 }
             });
             start_mouse_button_listener(app.handle().clone());
-            register_hotkeys_inner(
-                &app.handle(),
-                HotkeySettings {
-                    dictation: vec!["Ctrl+Alt+Space".to_string()],
-                    command_mode: vec!["Ctrl+Alt+E".to_string()],
-                },
-            )?;
+            // Start without bindings. The settings window applies the user's loaded
+            // configuration and reports conflicts without aborting desktop startup.
             Ok(())
         })
         .on_window_event(handle_window_event)
@@ -340,26 +338,67 @@ fn register_hotkeys_inner(app: &AppHandle, hotkeys: HotkeySettings) -> Result<()
 fn apply_hotkeys(app: &AppHandle, hotkeys: HotkeySettings, active: bool) -> Result<(), String> {
     let registered = parse_registered_hotkeys(hotkeys)?;
     let state = app.state::<DesktopState>();
-    if *state.hotkeys.lock().map_err(|e| e.to_string())? == registered {
+    let mut current = state.hotkeys.lock().map_err(|e| e.to_string())?;
+    replace_hotkeys(
+        &mut *current,
+        registered,
+        active,
+        &mut DesktopHotkeyRegistrar(app),
+    )
+}
+
+trait HotkeyRegistrar {
+    fn unregister_all(&mut self) -> Result<(), String>;
+    fn register(&mut self, shortcut: Shortcut) -> Result<(), String>;
+}
+
+struct DesktopHotkeyRegistrar<'a>(&'a AppHandle);
+
+impl HotkeyRegistrar for DesktopHotkeyRegistrar<'_> {
+    fn unregister_all(&mut self) -> Result<(), String> {
+        self.0
+            .global_shortcut()
+            .unregister_all()
+            .map_err(|e| e.to_string())
+    }
+    fn register(&mut self, shortcut: Shortcut) -> Result<(), String> {
+        self.0
+            .global_shortcut()
+            .register(shortcut)
+            .map_err(|e| e.to_string())
+    }
+}
+
+fn replace_hotkeys(
+    current: &mut RegisteredHotkeys,
+    registered: RegisteredHotkeys,
+    active: bool,
+    registrar: &mut impl HotkeyRegistrar,
+) -> Result<(), String> {
+    if *current == registered {
         return Ok(());
     }
     if active {
         return Err("Finish or cancel the active session before changing shortcuts.".into());
     }
-    app.global_shortcut()
-        .unregister_all()
-        .map_err(|e| e.to_string())?;
+    registrar.unregister_all()?;
+    // Never publish a partial configuration. Handlers consult this state, so any
+    // OS registrations left after a cleanup failure remain inert, including mice.
+    *current = RegisteredHotkeys::default();
     for shortcut in registered
         .dictation
         .keyboard
         .iter()
         .chain(registered.command_mode.keyboard.iter())
     {
-        app.global_shortcut()
-            .register(shortcut.clone())
-            .map_err(|e| e.to_string())?;
+        if let Err(error) = registrar.register(shortcut.clone()) {
+            return match registrar.unregister_all() {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(format!("{error}. Shortcut cleanup failed: {cleanup}. Shortcuts are inactive; retry saving settings.")),
+            };
+        }
     }
-    *state.hotkeys.lock().map_err(|e| e.to_string())? = registered;
+    *current = registered;
     Ok(())
 }
 
@@ -368,7 +407,9 @@ fn configure_desktop_settings_inner(
     settings: DesktopSettings,
 ) -> Result<(), String> {
     let state = app.state::<DesktopState>();
-    let commands = state.commands.lock().map_err(|e| e.to_string())?;
+    let mut commands = state.commands.lock().map_err(|e| e.to_string())?;
+    let experimental_paste = settings.runtime.as_ref()
+        .and_then(|r| r.experimental_automatic_paste).unwrap_or(false);
     let requested = settings
         .runtime
         .map(AudioDuckingSettings::from_runtime_settings)
@@ -378,11 +419,15 @@ fn configure_desktop_settings_inner(
         .lock()
         .map_err(|e| e.to_string())?;
     let active = commands.control.active.is_some();
+    if active && commands.experimental_paste != experimental_paste {
+        return Err("Finish or cancel the active session before changing paste mode.".into());
+    }
     if active && *audio_settings != requested {
         return Err("Finish or cancel the active session before changing audio settings.".into());
     }
     apply_hotkeys(app, settings.hotkeys, active)?;
     *audio_settings = requested;
+    commands.experimental_paste = experimental_paste;
     Ok(())
 }
 
@@ -882,7 +927,13 @@ fn enqueue_session_command(app: &AppHandle, binding: &str, mode: &str, action: &
             let Ok(id) = new_uuid() else {
                 return;
             };
-            commands.control.press(binding, mode, &id)
+            let command = commands.control.press(binding, mode, &id);
+            if command.is_some() {
+                commands.paste_target = if commands.experimental_paste && mode == "dictation" {
+                    new_uuid().ok().and_then(|capture| windows_paste::capture(&id, &capture))
+                } else { None };
+            }
+            command
         }
         "stop" => commands.control.release(binding),
         "cancel" => commands.control.cancel(),
@@ -938,9 +989,12 @@ fn start_command_dispatcher(app: AppHandle) {
                         let state = app.state::<DesktopState>();
                         let _startup = state.runtime_process.lock();
                     }
+                    let capture_id = app.state::<DesktopState>().commands.lock().ok()
+                        .and_then(|c| c.paste_target.as_ref().filter(|t| t.session_id == command.session_id).map(|t| t.capture_id.clone()));
                     let payload = serde_json::json!({"engine_id":identity.engine_id,"protocol_version":1,
                         "session_id":command.session_id,"command_seq":command.command_seq,
-                        "binding_id":command.binding_id,"mode":command.mode,"language":null});
+                        "binding_id":command.binding_id,"mode":command.mode,"language":null,
+                        "capture_id": if command.action == "start" { capture_id } else { None }});
                     let result = tauri::async_runtime::block_on(authenticated_request(
                         &app,
                         &identity,
@@ -1053,6 +1107,9 @@ fn settle_runtime_reply(
     reply: &serde_json::Value,
     command: bool,
 ) -> Option<DispatchDecision> {
+    // This is the existing serialized dispatcher, not an additional writer worker.
+    // Consume the captured target once before observing READY releases ownership.
+    let paste_message = maybe_compatibility_paste(app, id, identity, reply);
     let state = app.state::<DesktopState>();
     let current = state.engine_identity.lock().ok()?;
     if validate_reply(identity, current.as_ref(), reply).is_err() {
@@ -1076,7 +1133,12 @@ fn settle_runtime_reply(
         } else if ack.state != "starting" {
             restore_system_audio(app);
         }
-        show_recording_bar(app, &ack.state, &ack.mode, session::runtime_message(id, reply));
+        show_recording_bar(
+            app,
+            &ack.state,
+            &ack.mode,
+            paste_message.as_deref().or_else(|| session::runtime_message(id, reply)),
+        );
         if matches!(
             ack.state.as_str(),
             "ready" | "no_speech" | "cancelled" | "error"
@@ -1100,6 +1162,74 @@ fn settle_runtime_reply(
         }
     }
     Some(decision)
+}
+
+fn maybe_compatibility_paste(
+    app: &AppHandle, id: &str, identity: &EngineIdentity, reply: &serde_json::Value,
+) -> Option<String> {
+    if reply["state"] != "ready" || reply["busy"] != false
+        || reply["session_id"].as_str() != Some(id) { return None; }
+    let state = app.state::<DesktopState>();
+    let target = {
+        let current = state.engine_identity.lock().ok()?;
+        validate_reply(identity, current.as_ref(), reply).ok()?;
+        let mut commands = state.commands.lock().ok()?;
+        if !commands.experimental_paste || !commands.control.may_commit(id) { return None; }
+        // Taking this token makes every later observation inert, even if HTTP
+        // reservation/completion fails or returns an idempotent replay.
+        let Some(target) = commands.paste_target.take() else {
+            return Some("Automatic paste unavailable for the captured target. Copy the recoverable result manually.".into());
+        };
+        if target.session_id != id || reply["capture_id"] != target.capture_id
+            || reply["result_session_id"].as_str() != Some(id)
+            || reply["result_generation"] != reply["session_generation"] { return None; }
+        target
+    };
+    let Some(text) = reply["result"]["polished_text"].as_str().filter(|s| !s.trim().is_empty()) else {
+        return Some("Automatic paste skipped; copy the recoverable result manually.".into());
+    };
+    let transaction = new_uuid().ok()?;
+    let mut payload = serde_json::json!({"engine_id":identity.engine_id,"protocol_version":1,
+        "session_generation":reply["session_generation"],"session_id":id,
+        "transaction_id":transaction,"capture_id":target.capture_id,"result_session_id":id});
+    let reserved = tauri::async_runtime::block_on(authenticated_request(
+        app, identity, "POST", "/runtime/commit/reserve", Some(payload.clone())));
+    let Ok(reserved) = reserved else {
+        return Some("Paste authorization uncertain; no paste was sent. Copy the result manually; restart the engine if it remains busy.".into());
+    };
+    if reserved["reservation_decision"] != "reserved" || reserved["write_authorized"] != true {
+        return Some("Automatic paste was not authorized. Copy the result manually.".into());
+    }
+    let paste_result = {
+        // Match lock order used by hotkey cancellation and engine shutdown. A
+        // cancel already accepted locally suppresses delivery, even if reserve
+        // raced it. Once this bounded native call starts, cancellation is too late.
+        let current = state.engine_identity.lock().ok();
+        let commands = state.commands.lock().ok();
+        if current.as_ref().and_then(|v| v.as_ref()) != Some(identity)
+            || !commands.as_ref().is_some_and(|c| c.control.may_commit(id)) {
+            windows_paste::PasteResult::skipped()
+        } else {
+            #[cfg(windows)]
+            let owner = app.get_webview_window("main")
+                .and_then(|window| window.hwnd().ok()).map(|handle| handle.0 as usize).unwrap_or(0);
+            #[cfg(not(windows))]
+            let owner = 0;
+            windows_paste::paste(&target, text, owner)
+        }
+    };
+    payload["outcome"] = serde_json::json!(paste_result.outcome);
+    let completed = tauri::async_runtime::block_on(authenticated_request(
+        app, identity, "POST", "/runtime/commit/complete", Some(payload)));
+    if !completed.as_ref().is_ok_and(|r| r["accepted"] == true) {
+        return Some(format!("Paste completion could not be recorded. Do not retry automatically; inspect the target and copy the recoverable result if needed. Restart the engine if busy. {}", paste_result.clipboard_message()));
+    }
+    let message = match paste_result.outcome {
+        "inserted_unverified" => "Paste sent, delivery unverified. Check the target.",
+        "delivery_uncertain" => "Paste delivery uncertain. Check the target before copying or pasting again.",
+        _ => "Automatic paste skipped because the target changed or was unavailable. Copy the result manually.",
+    };
+    Some(format!("{message} {}", paste_result.clipboard_message()))
 }
 
 fn handle_mouse_button(app: &AppHandle, button: MouseButtonBinding, pressed: bool) {
@@ -1462,6 +1592,136 @@ fn python_executable(root: &PathBuf) -> PathBuf {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct FakeHotkeyRegistrar {
+        installed: Vec<Shortcut>,
+        calls: Vec<&'static str>,
+        fail_register_at: Option<usize>,
+        register_count: usize,
+        fail_unregister_at: Option<usize>,
+        unregister_count: usize,
+    }
+    impl HotkeyRegistrar for FakeHotkeyRegistrar {
+        fn unregister_all(&mut self) -> Result<(), String> {
+            self.calls.push("unregister");
+            self.unregister_count += 1;
+            if self.fail_unregister_at == Some(self.unregister_count) {
+                return Err("cleanup denied".into());
+            }
+            self.installed.clear();
+            Ok(())
+        }
+        fn register(&mut self, shortcut: Shortcut) -> Result<(), String> {
+            self.calls.push("register");
+            self.register_count += 1;
+            if self.fail_register_at == Some(self.register_count) {
+                return Err("HotKey already registered".into());
+            }
+            self.installed.push(shortcut);
+            Ok(())
+        }
+    }
+    fn test_hotkeys(key: &str) -> RegisteredHotkeys {
+        parse_registered_hotkeys(HotkeySettings {
+            dictation: vec![key.into(), "MouseX2".into()],
+            command_mode: vec!["Ctrl+Alt+E".into()],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn desktop_starts_unbound_and_applies_only_loaded_shortcuts() {
+        let desktop = DesktopState::default();
+        let mut current = desktop.hotkeys.lock().unwrap();
+        assert_eq!(*current, RegisteredHotkeys::default());
+        let loaded = parse_registered_hotkeys(HotkeySettings {
+            dictation: vec!["Ctrl+Shift+Alt+F11".into()],
+            command_mode: vec!["Ctrl+Shift+Alt+F12".into()],
+        }).unwrap();
+        let mut os = FakeHotkeyRegistrar::default();
+        replace_hotkeys(&mut *current, loaded.clone(), false, &mut os).unwrap();
+        assert_eq!(*current, loaded);
+        assert_eq!(os.installed, vec![parse_shortcut("Ctrl+Shift+Alt+F11").unwrap(), parse_shortcut("Ctrl+Shift+Alt+F12").unwrap()]);
+    }
+
+    #[test]
+    fn hotkey_conflict_discards_partial_bindings_and_allows_retry() {
+        let mut current = test_hotkeys("Ctrl+Alt+B");
+        let requested = test_hotkeys("Ctrl+Alt+Space");
+        let mut os = FakeHotkeyRegistrar {
+            fail_register_at: Some(2),
+            ..Default::default()
+        };
+        let error = replace_hotkeys(&mut current, requested.clone(), false, &mut os).unwrap_err();
+        assert!(error.contains("HotKey already registered"));
+        assert_eq!(current, RegisteredHotkeys::default());
+        assert!(os.installed.is_empty());
+        assert_eq!(
+            os.calls,
+            vec!["unregister", "register", "register", "unregister"]
+        );
+        os.fail_register_at = None;
+        replace_hotkeys(&mut current, requested.clone(), false, &mut os).unwrap();
+        assert_eq!(current, requested);
+        assert_eq!(os.installed.len(), 2);
+    }
+
+    #[test]
+    fn hotkey_conflict_reports_failed_cleanup_without_activating_bindings() {
+        let mut current = test_hotkeys("Ctrl+Alt+B");
+        let mut os = FakeHotkeyRegistrar {
+            fail_register_at: Some(2),
+            fail_unregister_at: Some(2),
+            ..Default::default()
+        };
+        let error = replace_hotkeys(&mut current, test_hotkeys("Ctrl+Alt+Space"), false, &mut os)
+            .unwrap_err();
+        assert!(error.contains("HotKey already registered"));
+        assert!(error.contains("cleanup denied"));
+        assert_eq!(current, RegisteredHotkeys::default());
+        assert_eq!(os.installed.len(), 1); // Present at OS level, inert in handlers.
+        os.fail_register_at = None;
+        os.fail_unregister_at = None;
+        replace_hotkeys(&mut current, test_hotkeys("Ctrl+Alt+Space"), false, &mut os).unwrap();
+        assert_eq!(os.installed.len(), 2);
+    }
+
+    #[test]
+    fn hotkey_initial_unregister_failure_preserves_existing_bindings() {
+        let original = test_hotkeys("Ctrl+Alt+B");
+        let mut current = original.clone();
+        let mut os = FakeHotkeyRegistrar {
+            fail_unregister_at: Some(1),
+            ..Default::default()
+        };
+        assert!(
+            replace_hotkeys(&mut current, test_hotkeys("Ctrl+Alt+Space"), false, &mut os).is_err()
+        );
+        assert_eq!(current, original);
+        assert_eq!(os.calls, vec!["unregister"]);
+    }
+
+    #[test]
+    fn hotkey_identical_configuration_is_noop_even_during_session() {
+        let mut current = test_hotkeys("Ctrl+Alt+B");
+        let same = current.clone();
+        let mut os = FakeHotkeyRegistrar::default();
+        replace_hotkeys(&mut current, same, true, &mut os).unwrap();
+        assert!(os.calls.is_empty());
+    }
+
+    #[test]
+    fn hotkey_changes_during_session_are_rejected_without_os_calls() {
+        let original = test_hotkeys("Ctrl+Alt+B");
+        let mut current = original.clone();
+        let mut os = FakeHotkeyRegistrar::default();
+        let error = replace_hotkeys(&mut current, test_hotkeys("Ctrl+Alt+Space"), true, &mut os)
+            .unwrap_err();
+        assert!(error.contains("Finish or cancel"));
+        assert_eq!(current, original);
+        assert!(os.calls.is_empty());
+    }
+
     #[test]
     fn parses_ctrl_alt_space() {
         let shortcut = parse_shortcut("Ctrl+Alt+Space").unwrap();
@@ -1619,6 +1879,7 @@ mod tests {
 }
 
 mod session;
+mod windows_paste;
 #[cfg(test)]
 mod ownership_tests {
     use super::*;

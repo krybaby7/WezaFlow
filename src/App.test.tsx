@@ -171,6 +171,21 @@ describe("App", () => {
     }
   });
 
+  it("keeps settings visible and reports the real startup shortcut conflict", async () => {
+    const conflict = "HotKey already registered: Ctrl+Alt+Space";
+    tauriMocks.configureDesktopSettings.mockRejectedValueOnce(new Error(conflict));
+    tauriMocks.configureDesktopSettings.mockRejectedValueOnce(conflict);
+    render(<App client={fakeClient()} />);
+    expect(await screen.findByText(new RegExp(conflict.replace(/[+]/g, "\\+")))).toBeInTheDocument();
+    await waitFor(() => expect(tauriMocks.configureDesktopSettings).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole("tablist", { name: "Settings sections" })).toBeInTheDocument();
+    expect(screen.queryByText(/Finish recording, then save again/)).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("tab", { name: "Dictation" }));
+    await userEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    expect(await screen.findByText("Settings saved")).toBeInTheDocument();
+    expect(screen.queryByText(/HotKey already registered/)).not.toBeInTheDocument();
+  });
+
   it("keeps persisted settings when shortcuts cannot reconfigure during capture", async () => {
     const busy = {status:"ok",state:"processing",mode:"dictation",profile:"low-impact",quiet_mode:false,quality_fallback:false,last_error:null,busy:true};
     const client=fakeClient({getStatus:vi.fn(async () => busy)});

@@ -43,6 +43,17 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "idle_timeout_seconds": 60,
         "reap_timeout_seconds": 5,
     },
+    "local_editor": {
+        "enabled": False,
+        "manifest_path": "",
+        "startup_timeout": 120,
+        "request_timeout": 15,
+        "idle_timeout": 60,
+        "reap_timeout": 5,
+        "threads": 2,
+        "context_tokens": 4096,
+        "output_tokens": 512,
+    },
     "hotkeys": {
         "dictation": ["Ctrl+Alt+Space"],
         "command_mode": ["Ctrl+Alt+E"],
@@ -63,6 +74,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "system_audio_ducking": True,
         "system_audio_duck_volume": 8,
         "use_ollama": False,
+        "experimental_automatic_paste": False,
     },
 }
 

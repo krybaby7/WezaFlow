@@ -22,6 +22,7 @@ import {
   type DependencyStatus,
   type LearningSuggestion,
   type LocalAsrSettings,
+  type LocalEditorSettings,
   type PendingCorrection,
   RuntimeApiClient,
   type RuntimeStatus,
@@ -155,6 +156,11 @@ function settingsForSave(settings: Settings): Settings {
   };
 }
 
+function desktopSettingsError(error: unknown): string {
+  const detail = error instanceof Error ? error.message : typeof error === "string" ? error : "Unknown desktop configuration error";
+  return `Desktop shortcuts could not be applied: ${detail}. Edit shortcuts and save settings to retry.`;
+}
+
 export function App({ client = DEFAULT_CLIENT }: { client?: RuntimeClient }) {
   if (getDesktopWindowLabel() === "recording-bar") {
     return <RecordingFeedbackBar />;
@@ -228,9 +234,10 @@ function SettingsApp({ client = DEFAULT_CLIENT }: { client?: RuntimeClient }) {
     const pending = pendingDesktopSettings;
     setPendingDesktopSettings(null);
     void configureDesktopSettings(pending).then(() => {
+      setError(null);
       setMessage("Settings saved and desktop shortcuts applied");
-    }).catch(() => {
-      setError("Settings are saved for the next session. Finish recording, then save again to apply desktop shortcuts.");
+    }).catch((err: unknown) => {
+      setError(desktopSettingsError(err));
     });
   }, [status?.state, status?.busy, pendingDesktopSettings]);
 
@@ -270,7 +277,8 @@ function SettingsApp({ client = DEFAULT_CLIENT }: { client?: RuntimeClient }) {
       setSnippets(nextSnippets);
       try {
         await configureDesktopSettings(nextSettings);
-      } catch {
+      } catch (err) {
+        setError(desktopSettingsError(err));
         setPendingDesktopSettings(nextSettings);
       }
 
@@ -326,7 +334,8 @@ function SettingsApp({ client = DEFAULT_CLIENT }: { client?: RuntimeClient }) {
     let desktopApplied = true;
     try {
       await configureDesktopSettings(saved);
-    } catch {
+    } catch (err) {
+      setError(desktopSettingsError(err));
       desktopApplied = false;
       setPendingDesktopSettings(saved);
     }
@@ -661,10 +670,10 @@ function StatusPanel({
   diagnostics: string[];
 }) {
   const [copyState, setCopyState] = useState("");
-  async function copyResult() {
+  async function copyResult(raw = false) {
     if (!status?.result) return;
     try {
-      await navigator.clipboard.writeText(status.result.polished_text);
+      await navigator.clipboard.writeText(raw ? status.result.raw_transcript : status.result.polished_text);
       setCopyState("Copied. Paste into your chosen field.");
     } catch {
       setCopyState("Copy unavailable. Select and copy the text below.");
@@ -687,13 +696,18 @@ function StatusPanel({
         {status?.asr_worker && <p role="status">{localWorkerNote(status.asr_worker)}</p>}
         {status?.asr_worker?.last_error && <p role="alert">{status.asr_worker.last_error}</p>}
         {status?.last_error && <p role="alert">{status.last_error}</p>}
-        <p>Automatic insertion and command editing are unavailable during the safety rebuild.</p>
+        <p>Local cleanup is experimental. Compare the result with the raw transcript before relying on it. Command editing remains unavailable.</p>
+        {status?.local_editor?.configured_enabled && <p>Local cleanup worker: {status.local_editor.state.toLowerCase()}.</p>}
+        {status?.local_editor?.last_error && <p role="alert">Local cleanup was unavailable. The raw transcript remains recoverable.</p>}
+        {status?.insertion_transaction?.outcome && <p role="status">Paste outcome: {status.insertion_transaction.outcome.replaceAll("_", " ")}. Check the destination before pasting again.</p>}
         {status?.result && <section aria-label="Result recovery">
           <h3>{status.result_session_id === status.session_id ? "Session result" : "Previous session result"}</h3>
           {status.result.diagnostics?.capture?.terminal_code === "duration_limit" && <p role="alert">This saved result contains only the first five minutes of its recording.</p>}
-          <textarea aria-label="Recoverable dictation" readOnly value={status.result.polished_text} />
-          <details><summary>Raw transcript</summary><p>{status.result.raw_transcript}</p></details>
+          {status.result.diagnostics?.editing?.outcome === "raw_fallback" && <p>Cleanup was off or unavailable; this result contains the raw transcription.</p>}
+          <textarea aria-label="Recoverable dictation" dir="auto" readOnly value={status.result.polished_text} />
+          <details><summary>Raw transcript</summary><p dir="auto">{status.result.raw_transcript}</p></details>
           <button type="button" onClick={() => void copyResult()}>Copy result</button>
+          <button type="button" onClick={() => void copyResult(true)}>Copy raw transcript</button>
           <p role="status">{copyState}</p>
         </section>}
       </div>
@@ -886,6 +900,13 @@ function DictationPanel({
   onSave: () => void;
 }) {
   const localAsr = settings.local_asr ?? DEFAULT_LOCAL_ASR;
+  const localEditor: LocalEditorSettings = settings.local_editor ?? {
+    enabled: false, manifest_path: "", startup_timeout: 120, request_timeout: 15,
+    idle_timeout: 60, reap_timeout: 5, threads: 2, context_tokens: 4096, output_tokens: 512
+  };
+  function updateLocalEditor(update: Partial<LocalEditorSettings>) {
+    onSettings({...settings, local_editor: {...localEditor, ...update}});
+  }
   function updateLocalAsr(update: Partial<LocalAsrSettings>) {
     onSettings({...settings, local_asr: {...localAsr, ...update}});
   }
@@ -897,7 +918,7 @@ function DictationPanel({
   return (
     <div className="section">
       <h2>Dictation</h2>
-      <p>Command editing, automatic insertion, quality fallback, and background model warmup are unavailable during the rebuild. Existing CPU profiles support English; the experimental local profile supports evaluating multilingual models.</p>
+      <p>Use Local multilingual for English, French and Egyptian Arabic. Keep Language on Auto for mixed speech. Command editing and background model warmup remain unavailable.</p>
       <div className="grid two">
         <label>
           ASR profile
@@ -949,7 +970,7 @@ function DictationPanel({
       </div>
       {settings.runtime.profile === "local-multilingual" && <fieldset>
         <legend>Local multilingual setup</legend>
-        <p>Requires local model files. Paths are checked when saving; model readiness is checked on first dictation. Recognition quality is still being evaluated. Local grammar editing is not connected yet, so this profile preserves the raw transcript.</p>
+        <p>Requires local model files. Model readiness is checked on first dictation. Recognition and cleanup quality need your review.</p>
         <div className="grid two">
           <label>Local model folder
             <input value={localAsr.snapshot_path} onChange={(event) => updateLocalAsr({snapshot_path: event.target.value})} />
@@ -973,7 +994,22 @@ function DictationPanel({
           </label>
         </div>
         <p>Idle seconds controls how long the worker keeps the model loaded after dictation. Set 0 for no retention.</p>
+        <label><input type="checkbox" checked={localEditor.enabled} onChange={(event) => updateLocalEditor({enabled: event.target.checked})} /> Local cleanup (experimental)</label>
+        <p>Attempts grammar, stutter and spoken-correction cleanup. Arabic-first sentences keep Arabic script; English/French-first sentences use numeric Arabizi for Arabic words. The model can make mistakes. Raw text is always retained.</p>
+        <div className="grid two">
+          <label>Local cleanup manifest
+            <input value={localEditor.manifest_path} onChange={(event) => updateLocalEditor({manifest_path: event.target.value})} />
+          </label>
+          <label>Cleanup idle seconds
+            <input type="number" min="1" max="3600" value={localEditor.idle_timeout} onChange={(event) => updateLocalEditor({idle_timeout: Number(event.target.value)})} />
+          </label>
+        </div>
       </fieldset>}
+      <fieldset>
+        <legend>Automatic paste trial</legend>
+        <label><input type="checkbox" checked={settings.runtime.experimental_automatic_paste ?? false} onChange={(event) => onSettings({...settings, runtime: {...settings.runtime, experimental_automatic_paste: event.target.checked}})} /> Enable experimental automatic paste</label>
+        <p>Uses Ctrl+V after dictation and leaves the result on your clipboard. Focus checks cannot prevent every race or detect every password field. Use ordinary, non-sensitive text fields and keep the caret still. Delivery is unverified; check the destination before trying again. Leave this off to use Copy result.</p>
+      </fieldset>
       <div className="toggles">
         <label>
           <input

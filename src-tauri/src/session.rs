@@ -342,6 +342,9 @@ pub(super) struct SessionControl {
     cancel_command: Option<SessionCommand>,
 }
 impl SessionControl {
+    pub fn may_commit(&self, id: &str) -> bool {
+        self.active.as_ref().is_some_and(|c| c.session_id == id) && !self.cancelled
+    }
     pub fn press(&mut self, binding: &str, mode: &str, id: &str) -> Option<SessionCommand> {
         if self.active.is_some() {
             return None;

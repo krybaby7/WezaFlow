@@ -46,6 +46,7 @@ class RuntimeApiState:
     quiet_mode: bool = False
     quality_fallback: bool = False
     asr_service: Any | None = None
+    editor_service: Any | None = None
 
     @property
     def settings_path(self) -> Path:
@@ -112,6 +113,7 @@ def create_app(
     engine_id: str | None = None,
     controller_factory: Callable | None = None,
     asr_service: Any | None = None,
+    editor_service: Any | None = None,
 ):
     try:
         from fastapi import FastAPI, HTTPException, Query
@@ -133,6 +135,10 @@ def create_app(
         from services.asr.worker import AsrWorkerService
         asr_service = AsrWorkerService()
     state.asr_service = asr_service
+    if editor_service is None:
+        from services.runtime.local_editor import LocalEditorOwner
+        editor_service = LocalEditorOwner()
+    state.editor_service = editor_service
     controller = SerializedSessionController(
         factory=controller_factory or (lambda settings: _create_session_adapters(state, settings)),
         settings_provider=lambda: load_settings(state.settings_path), engine_id=instance_id,
@@ -141,8 +147,9 @@ def create_app(
     def close_resources():
         controller.close()
         reaped = state.asr_service.close(timeout_seconds=5)
+        editor_reaped = state.editor_service.close(timeout_seconds=5)
         settled = controller.wait_for_worker(2)
-        return reaped and settled
+        return reaped and editor_reaped and settled
 
     @asynccontextmanager
     async def lifespan(app):
@@ -156,6 +163,7 @@ def create_app(
     app = FastAPI(title="LocalFlow Runtime API", version="0.1.0", lifespan=lifespan)
     app.state.controller = controller
     app.state.asr_service = asr_service
+    app.state.editor_service = editor_service
     app.state.close_resources = close_resources
     app.state.shutdown_requested = Event()
 
@@ -191,7 +199,9 @@ def create_app(
         runtime = settings.get("runtime", {})
         return {**controller.snapshot(), "profile": runtime.get("profile", DEFAULT_ASR_PROFILE),
                 "quiet_mode": runtime.get("quiet_mode", False), "quality_fallback": False,
-                "asr_worker": state.asr_service.snapshot()}
+                "asr_worker": state.asr_service.snapshot(),
+                "local_editor": {**state.editor_service.snapshot(),
+                                 "configured_enabled": settings.get('local_editor', {}).get('enabled', False)}}
 
     @app.post("/runtime/start")
     def start_runtime(payload: dict[str, Any]) -> dict[str, Any]:
@@ -248,6 +258,9 @@ def create_app(
         with settings_lock:
             lines = state.diagnostic_lines(limit=limit)
         snapshot = controller.snapshot()
+        editor = state.editor_service.snapshot()
+        configured_editor = controller.settings_snapshot().get('local_editor', {})
+        lines.append(f"Local editor: experimental/unqualified; enabled={configured_editor.get('enabled', False)} state={editor.get('state')} last_session={editor.get('configuration_status')} error={editor.get('last_error')}")
         active = snapshot.get("active_configuration")
         if active:
             lines.insert(1, f"Session snapshot: state={snapshot['state']} profile={active['profile']} model={active['model']} threads={active['cpu_threads']}; configured changes apply to the next session")
@@ -491,12 +504,15 @@ def _create_session_adapters(state: RuntimeApiState, settings: dict):
     profile = resolve_asr_profile(runtime.get("profile", DEFAULT_ASR_PROFILE))
     overrides = {}
     if profile.name == 'local-multilingual':
-        from services.runtime.local_asr import worker_config, RawRecoveryFormatter
+        from services.runtime.local_asr import worker_config
         from services.snippets.engine import SnippetEngine
         if state.asr_service is None:
             raise RuntimeError('Local inference service is unavailable')
         overrides = {'transcriber': state.asr_service.transcriber(worker_config(settings)),
-                     'formatter': RawRecoveryFormatter(), 'snippets': SnippetEngine([])}
+                     'formatter': state.editor_service.formatter(settings), 'snippets': SnippetEngine([])}
+    elif state.editor_service is not None:
+        # Changing away from the local profile releases its owned editor too.
+        state.editor_service.formatter({'local_editor': {'enabled': False}})
     pipeline = build_pipeline(root=state.root, settings=settings,
                               use_ollama=bool(runtime.get("use_ollama", False)),
                               quiet_mode=bool(runtime.get("quiet_mode", False)),
