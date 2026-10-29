@@ -56,6 +56,8 @@ class PipelineOrchestrator:
             initial_prompt=self._asr_initial_prompt(vocabulary_hints),
         )
         asr_ms = self._elapsed_ms(phase_started)
+        if not asr_result.text.strip():
+            return None
 
         phase_started = time.perf_counter()
         polished_text = self._expand_or_format(
@@ -115,6 +117,8 @@ class PipelineOrchestrator:
             initial_prompt=self._asr_initial_prompt(None),
         )
         asr_ms = self._elapsed_ms(phase_started)
+        if not asr_result.text.strip():
+            return None
 
         phase_started = time.perf_counter()
         edit_result = self.formatter.command_edit(selected_text, asr_result.text)
