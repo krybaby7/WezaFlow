@@ -61,7 +61,7 @@ class RuntimeAudioTests(unittest.TestCase):
                 raise ImportError("No module named sounddevice")
 
             def stop(self) -> bytes:
-                raise AssertionError("stop should not run when startup fails")
+                return b""  # Failed starts still receive best-effort cleanup.
 
         with tempfile.TemporaryDirectory() as temp_dir:
             with self.assertRaises(RuntimeError) as raised:
@@ -135,6 +135,41 @@ class RuntimeAudioTests(unittest.TestCase):
         self.assertIn("-ExecutionPolicy Bypass", content)
         self.assertIn("-File", content)
         self.assertIn("record_benchmark_pack.ps1", content)
+
+
+class RecordingCleanupTests(unittest.TestCase):
+    def test_interruptions_and_failures_cleanup_once_without_output(self):
+        from services.runtime.audio_smoke import record_wav
+        for stage in ('start', 'sleep', 'stop'):
+            for failure in (KeyboardInterrupt('cancel'), ValueError('failure')):
+                with self.subTest(stage=stage, failure=type(failure).__name__):
+                    calls = []
+                    class Recorder:
+                        def start(self):
+                            calls.append('start')
+                            if stage == 'start':
+                                raise failure
+                        def stop(self):
+                            calls.append('stop')
+                            if stage == 'stop':
+                                raise failure
+                            if stage in ('start', 'sleep'):
+                                raise RuntimeError('cleanup failed too')
+                    def sleep(seconds):
+                        if stage == 'sleep':
+                            raise failure
+                    with tempfile.TemporaryDirectory() as directory:
+                        path = Path(directory) / 'test.wav'
+                        with self.assertRaises(BaseException) as raised:
+                            record_wav(path, recorder_factory=Recorder, sleep=sleep)
+                        actual = raised.exception
+                        if stage == 'start' and isinstance(failure, Exception):
+                            self.assertIs(actual.__cause__, failure)
+                            self.assertIn('sounddevice', str(actual))
+                        else:
+                            self.assertIs(actual, failure)
+                        self.assertEqual(calls, ['start', 'stop'])
+                        self.assertFalse(path.exists())
 
 
 if __name__ == "__main__":

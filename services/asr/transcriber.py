@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from threading import RLock
 from time import perf_counter
-from typing import Any
+from typing import Any, Callable
 
 from services.pipeline.models import AsrResult
 
@@ -49,25 +50,49 @@ class FasterWhisperBackend:
 
 
 class Transcriber:
-    def __init__(self, backend=None, model_name: str = "large-v3-turbo", **model_kwargs: Any) -> None:
+    def __init__(
+        self,
+        backend=None,
+        model_name: str = "large-v3-turbo",
+        *,
+        clock: Callable[[], float] = perf_counter,
+        **model_kwargs: Any,
+    ) -> None:
         self.backend = backend
+        self._clock = clock
         self.model_name = model_name
         self.model_kwargs = model_kwargs
         self._lock = RLock()
 
     def transcribe(self, audio, language: str | None = None, initial_prompt: str | None = None) -> AsrResult:
-        started = perf_counter()
+        started = self._clock()
         with self._lock:
+            acquired = self._clock()
             backend = self._backend()
             raw_result = backend.transcribe(
                 audio,
                 language=language,
                 initial_prompt=initial_prompt,
             )
-        elapsed_ms = int((perf_counter() - started) * 1000)
-        return self._to_asr_result(raw_result, fallback_language=language, elapsed_ms=elapsed_ms)
+            # faster-whisper executes inference while its segments are iterated.
+            result = self._to_asr_result(raw_result, fallback_language=language, elapsed_ms=0)
+            finished = self._clock()
+            elapsed_ms = int((finished - started) * 1000)
+            has_duration = (
+                isinstance(raw_result, AsrResult)
+                or isinstance(raw_result, dict) and "duration_ms" in raw_result
+                or isinstance(raw_result, tuple) and len(raw_result) == 2
+                and getattr(raw_result[1], "duration", None) is not None
+            )
+            return replace(
+                result,
+                duration_ms=result.duration_ms if has_duration else elapsed_ms,
+                inference_ms=int((finished - acquired) * 1000),
+                queue_ms=int((acquired - started) * 1000),
+            )
 
     def warm_up(self, language: str | None = None) -> None:
+        """Prepare the backend; the default backend loads its model only."""
         with self._lock:
             backend = self._backend()
             warm_up = getattr(backend, "warm_up", None)
@@ -91,6 +116,7 @@ class Transcriber:
                 text=str(raw_result.get("text", "")).strip(),
                 language=raw_result.get("language", fallback_language),
                 duration_ms=int(raw_result.get("duration_ms", elapsed_ms)),
+                audio_duration_ms=raw_result.get("audio_duration_ms"),
             )
 
         if isinstance(raw_result, tuple) and len(raw_result) == 2:
@@ -102,6 +128,7 @@ class Transcriber:
                 text=text,
                 language=getattr(info, "language", fallback_language),
                 duration_ms=duration_ms,
+                audio_duration_ms=int(duration * 1000) if duration is not None else None,
             )
 
         return AsrResult(text=str(raw_result).strip(), language=fallback_language, duration_ms=elapsed_ms)

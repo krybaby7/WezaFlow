@@ -277,6 +277,202 @@ class TranscriberTests(unittest.TestCase):
         self.assertEqual(Backend.created, 1)
         self.assertEqual(transcriber.backend.warmups, ["en"])
 
+class TranscriberContractTests(unittest.TestCase):
+    def test_lazy_segments_are_consumed_under_lock_for_transcribe_and_warmup(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event, RLock
+        from types import SimpleNamespace
+        from services.asr.transcriber import Transcriber
+
+        for operation in ('transcribe', 'warm_up'):
+            with self.subTest(operation=operation):
+                entered, release, attempted = Event(), Event(), Event()
+                calls = []
+                class ObservedLock:
+                    def __init__(self):
+                        self.lock = RLock()
+                    def __enter__(self):
+                        if entered.is_set():
+                            attempted.set()
+                        self.lock.acquire()
+                    def __exit__(self, *args):
+                        self.lock.release()
+                class Backend:
+                    def transcribe(self, *args, **kwargs):
+                        calls.append('transcribe')
+                        def segments():
+                            entered.set()
+                            if not release.wait(3):
+                                raise RuntimeError('test release timed out')
+                            calls.append('consumed')
+                            yield SimpleNamespace(text='hello')
+                        return segments(), SimpleNamespace(language='en', duration=1)
+                    def warm_up(self, **kwargs):
+                        calls.append('warm_up')
+                transcriber = Transcriber(backend=Backend())
+                transcriber._lock = ObservedLock()
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    first = pool.submit(transcriber.transcribe, [])
+                    self.assertTrue(entered.wait(3))
+                    acquired = transcriber._lock.lock.acquire(blocking=False)
+                    if acquired:
+                        transcriber._lock.lock.release()
+                        release.set()
+                    self.assertFalse(acquired, 'lazy inference must retain the transcriber lock')
+                    second = pool.submit(getattr(transcriber, operation), *([[]] if operation == 'transcribe' else []))
+                    try:
+                        self.assertTrue(attempted.wait(3))
+                        self.assertEqual(calls, ['transcribe'])
+                    finally:
+                        release.set()
+                    first.result(3)
+                    second.result(3)
+                self.assertLess(calls.index('consumed'), calls.index(operation, 1))
+
+    def test_explicit_timings_include_lazy_work_and_separate_queue(self):
+        from types import SimpleNamespace
+        from services.asr.transcriber import Transcriber
+        now = [0.0]
+        class Lock:
+            def __enter__(self):
+                now[0] += 2
+            def __exit__(self, *args):
+                pass
+        class Backend:
+            def transcribe(self, *args, **kwargs):
+                now[0] += 3
+                def segments():
+                    now[0] += 4
+                    yield SimpleNamespace(text='hello')
+                return segments(), SimpleNamespace(language='ar', duration=1.25)
+        transcriber = Transcriber(backend=Backend(), clock=lambda: now[0])
+        transcriber._lock = Lock()
+        result = transcriber.transcribe([])
+        self.assertEqual(result.inference_ms, 7000)
+        self.assertEqual(result.queue_ms, 2000)
+        self.assertEqual(result.audio_duration_ms, 1250)
+        self.assertEqual(result.duration_ms, 1250)
+
+    def test_generator_failure_releases_lock(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from types import SimpleNamespace
+        from services.asr.transcriber import Transcriber
+        class Backend:
+            def transcribe(self, *args, **kwargs):
+                def segments():
+                    raise ValueError('broken segments')
+                    yield
+                return segments(), SimpleNamespace()
+            def warm_up(self, **kwargs):
+                return None
+        transcriber = Transcriber(backend=Backend())
+        with self.assertRaisesRegex(ValueError, 'broken segments'):
+            transcriber.transcribe([])
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(transcriber.warm_up).result(3)
+
+    def test_dict_and_existing_result_keep_metadata_and_legacy_duration(self):
+        from services.asr.transcriber import Transcriber
+        from services.pipeline.models import AsrResult
+        for raw in ({'text': 'hi', 'language': 'ar', 'duration_ms': 42, 'audio_duration_ms': 900},
+                    AsrResult('hi', 'ar', 42, audio_duration_ms=900)):
+            with self.subTest(raw=raw):
+                class Backend:
+                    def transcribe(self, *args, **kwargs):
+                        return raw
+                ticks = iter([0, 2, 5])
+                result = Transcriber(backend=Backend(), clock=lambda: next(ticks)).transcribe([])
+                self.assertEqual((result.text, result.language, result.duration_ms), ('hi', 'ar', 42))
+                self.assertEqual(result.audio_duration_ms, 900)
+                self.assertEqual((result.inference_ms, result.queue_ms), (3000, 2000))
+
+
+class AudioRecorderFailureTests(unittest.TestCase):
+    def test_stop_and_close_drain_final_callbacks_before_invalidating_capture(self):
+        from services.asr.audio_capture import AudioRecorder
+        callbacks = []
+        class Stream:
+            def start(self):
+                callbacks[-1]([[0.1]])
+            def stop(self):
+                callbacks[-1]([[0.2]])
+            def close(self):
+                callbacks[-1]([[0.3]])
+        def factory(callback, *args):
+            callbacks.append(callback)
+            return Stream()
+        recorder = AudioRecorder(stream_factory=factory)
+        recorder.start()
+        data = recorder.stop()
+        with wave.open(io.BytesIO(data), 'rb') as wav:
+            self.assertEqual(wav.getnframes(), 3)
+            frames = wav.readframes(3)
+        self.assertEqual([int.from_bytes(frames[i:i+2], 'little', signed=True)
+                          for i in range(0, len(frames), 2)], [3277, 6553, 9830])
+        callbacks[0]([[0.4]])
+        self.assertEqual(recorder.snapshot_samples(), [])
+        recorder.start()
+        callbacks[0]([[0.8]])
+        self.assertEqual(recorder.snapshot_samples(), [0.1])
+        recorder.stop()
+
+
+    def test_failure_cleanup_resets_state_discards_frames_and_allows_retry(self):
+        from services.asr.audio_capture import AudioRecorder
+        for stage in ('factory', 'start', 'stop', 'close'):
+            for failure in (ValueError('failure'), KeyboardInterrupt('cancel')):
+                with self.subTest(stage=stage, failure=type(failure).__name__):
+                    callbacks, streams = [], []
+                    failing = [True]
+                    class Stream:
+                        def __init__(self):
+                            self.closed = 0
+                            self.stopped = 0
+                        def start(self):
+                            callbacks[-1]([[0.25]])
+                            if failing[0] and stage == 'start':
+                                raise failure
+                        def stop(self):
+                            self.stopped += 1
+                            callbacks[-1]([[0.9]])
+                            if failing[0] and stage == 'stop':
+                                raise failure
+                        def close(self):
+                            self.closed += 1
+                            if failing[0] and stage in ('start', 'stop', 'close'):
+                                raise failure if stage == 'close' else RuntimeError('cleanup failure')
+                    def factory(callback, *args):
+                        callbacks.append(callback)
+                        callback([[0.1]])
+                        if failing[0] and stage == 'factory':
+                            raise failure
+                        stream = Stream()
+                        streams.append(stream)
+                        return stream
+                    recorder = AudioRecorder(stream_factory=factory)
+                    with self.assertRaises(BaseException) as raised:
+                        recorder.start()
+                        recorder.stop()
+                    self.assertIs(raised.exception, failure)
+                    self.assertFalse(recorder.is_recording)
+                    self.assertIsNone(recorder._stream)
+                    self.assertEqual(recorder.snapshot_samples(), [])
+                    if streams:
+                        self.assertEqual(streams[0].closed, 1)
+                    recorder.stop()
+                    if streams:
+                        self.assertEqual(streams[0].closed, 1)
+                    old_callback = callbacks[0]
+                    failing[0] = False
+                    recorder.start()
+                    old_callback([[0.8]])
+                    self.assertEqual(recorder.snapshot_samples(), [0.1, 0.25])
+                    data = recorder.stop()
+                    with wave.open(io.BytesIO(data), 'rb') as wav:
+                        self.assertEqual(wav.getnframes(), 3)
+                    self.assertEqual(recorder.snapshot_samples(), [])
+                    self.assertFalse(recorder.is_recording)
+
 
 if __name__ == "__main__":
     unittest.main()

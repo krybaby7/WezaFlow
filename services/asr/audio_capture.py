@@ -23,7 +23,9 @@ class AudioRecorder:
         self._stream = None
         self._frames: list[float] = []
         self._lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
         self._is_recording = False
+        self._capture_token = None
 
     @classmethod
     def microphone(cls, sample_rate: int = 16000, blocksize: int = 1024) -> "AudioRecorder":
@@ -38,23 +40,61 @@ class AudioRecorder:
         return self._is_recording
 
     def start(self) -> None:
+        with self._lifecycle_lock:
+            self._start_capture()
+
+    def _start_capture(self) -> None:
         with self._lock:
+            if self._is_recording:
+                raise RuntimeError("Audio recorder is already recording")
             self._frames = []
-        self._is_recording = True
-        if self._stream_factory is not None:
-            self._stream = self._stream_factory(self._callback, self.sample_rate, self.blocksize)
-            self._stream.start()
+            self._is_recording = True
+            token = self._capture_token = object()
+
+        def callback(indata, frames=None, time=None, status=None):
+            del frames, time, status
+            with self._lock:
+                if self._is_recording and self._capture_token is token:
+                    self._frames.extend(_flatten_mono_samples(indata))
+
+        try:
+            if self._stream_factory is not None:
+                self._stream = self._stream_factory(callback, self.sample_rate, self.blocksize)
+                self._stream.start()
+        except BaseException:
+            # A stream may already be active when start raises, including Ctrl-C.
+            try:
+                self.stop()
+            except BaseException:
+                pass  # Preserve the original startup failure.
+            raise
 
     def stop(self) -> bytes:
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-            finally:
-                self._stream.close()
+        with self._lifecycle_lock:
+            return self._stop_capture()
+
+    def _stop_capture(self) -> bytes:
+        stream = self._stream
+        try:
+            if stream is not None:
+                try:
+                    stream.stop()
+                except BaseException:
+                    try:
+                        stream.close()
+                    except BaseException:
+                        pass  # Preserve the first capture failure.
+                    raise
+                else:
+                    stream.close()
+        finally:
+            # Keep this generation valid during backend drain/close callbacks.
+            # Never hold the frame lock while calling a stream adapter.
+            with self._lock:
+                self._is_recording = False
+                self._capture_token = None
                 self._stream = None
-        self._is_recording = False
-        with self._lock:
-            frames = list(self._frames)
+                frames, self._frames = self._frames, []
         return self.float_samples_to_wav_bytes(frames, sample_rate=self.sample_rate)
 
     def snapshot_samples(self) -> list[float]:
@@ -62,8 +102,8 @@ class AudioRecorder:
             return list(self._frames)
 
     def inject_frame(self, samples: Iterable[float]) -> None:
-        if self._is_recording:
-            with self._lock:
+        with self._lock:
+            if self._is_recording:
                 self._frames.extend(float(sample) for sample in samples)
 
     def _callback(self, indata, frames=None, time=None, status=None) -> None:

@@ -33,9 +33,20 @@ class PipelineRequest:
 
 @dataclass(frozen=True)
 class AsrResult:
+    """ASR output with explicit timing units.
+
+    duration_ms is retained for compatibility: backend-supplied duration when
+    available (tuple backends use audio duration), otherwise total call time.
+    inference_ms measures backend execution and lazy segment materialization;
+    queue_ms measures lock wait. Unknown audio duration remains None.
+    """
+
     text: str
     language: str | None
     duration_ms: int
+    inference_ms: int = 0
+    queue_ms: int = 0
+    audio_duration_ms: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

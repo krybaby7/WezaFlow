@@ -18,16 +18,26 @@ def record_wav(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     recorder = recorder_factory()
+    stop_attempted = False
     try:
-        recorder.start()
-    except Exception as exc:
-        raise RuntimeError(
-            "Unable to start microphone recording. Install sounddevice and check "
-            "microphone permissions/device availability."
-        ) from exc
+        try:
+            recorder.start()
+        except Exception as exc:
+            raise RuntimeError(
+                "Unable to start microphone recording. Install sounddevice and check "
+                "microphone permissions/device availability."
+            ) from exc
+        sleep(seconds)
+        stop_attempted = True
+        wav_bytes = recorder.stop()
+    except BaseException:
+        if not stop_attempted:
+            try:
+                recorder.stop()
+            except BaseException:
+                pass  # Preserve the original error or interruption.
+        raise
 
-    sleep(seconds)
-    wav_bytes = recorder.stop()
     output_path.write_bytes(wav_bytes)
     return output_path
 
