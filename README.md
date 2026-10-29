@@ -36,10 +36,17 @@ separate Python API before opening the desktop app.
 
 The local trilingual rebuild currently returns recoverable text with an explicit
 **Copy result** action. Automatic insertion, command editing, speculative
-processing, automatic warmup, and the legacy CLI capture path are unavailable
-while the new lifecycle and insertion adapters are qualified. Existing ASR
-profiles are English-only; multilingual recognition and grammar editing are
-still pending evaluation. See [implementation progress](docs/implementation-progress.md)
+processing, background prewarming, and the legacy CLI capture path are unavailable
+while the new lifecycle and insertion adapters are qualified. Existing CPU
+profiles are English-only. The experimental **Local multilingual** profile uses
+an explicit local model folder and an owned inference process with configurable
+idle unload; it preserves raw text until local grammar editing is connected.
+Saving checks paths, while first dictation checks actual model readiness. The
+profile requires a complete faster-whisper snapshot (weights, configuration,
+tokenizer, vocabulary and preprocessor); an optional verified GPU runtime manifest
+supplies DLLs to the child process without changing system PATH. No models are
+downloaded during dictation. Multilingual quality and power remain unqualified.
+See [implementation progress](docs/implementation-progress.md)
 and [speech collection instructions](docs/dictation-corpus-collection.md).
 
 ## macOS test build

@@ -1,6 +1,13 @@
 export type Fetcher = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
 export type RuntimeStatus = {
+  asr_worker?: {
+    state: string;
+    busy: boolean;
+    pid?: number | null;
+    generation?: string | null;
+    last_error?: string | null;
+  };
   status: string;
   state: string;
   mode: string;
@@ -21,7 +28,20 @@ export type DependencyStatus = {
   install_hint: string;
 };
 
+export type LocalAsrSettings = {
+  snapshot_path: string;
+  runtime_manifest_path: string;
+  device: "cpu" | "cuda";
+  compute_type: string;
+  cpu_threads: number;
+  startup_timeout_seconds: number;
+  decode_timeout_seconds: number;
+  idle_timeout_seconds: number;
+  reap_timeout_seconds: number;
+};
+
 export type Settings = {
+  local_asr?: LocalAsrSettings;
   hotkeys: {
     dictation: string | string[];
     command_mode: string | string[];

@@ -140,6 +140,12 @@ class SerializedSessionController:
                         'sample_rate': snapshot.get('audio', {}).get('sample_rate', 16000),
                         'blocksize': snapshot.get('audio', {}).get('blocksize', 1024),
                     }
+                    if snapshot.get('runtime', {}).get('profile') == 'local-multilingual':
+                        local = snapshot.get('local_asr', {})
+                        self._active_configuration.update(model=local.get('snapshot_path'),
+                                                          cpu_threads=local.get('cpu_threads'),
+                                                          device=local.get('device'),
+                                                          compute_type=local.get('compute_type'))
                     self._thread = Thread(target=self._run, args=(snapshot,), name='wezza-session-worker', daemon=True)
                     self._thread.start()
             elif sid != self._session_id:
@@ -303,7 +309,7 @@ def freeze_settings(value):
 def validate_session_settings(settings):
     if not isinstance(settings, dict):
         raise ValueError('Settings must be an object')
-    for section in ('audio', 'vad', 'models', 'runtime', 'injection'):
+    for section in ('audio', 'vad', 'models', 'runtime', 'injection', 'local_asr'):
         if section in settings and not isinstance(settings[section], dict):
             raise ValueError(f'{section} must be an object')
     audio = settings.get('audio', {})
@@ -326,6 +332,9 @@ def validate_session_settings(settings):
     profile = runtime.get('profile', 'low-impact')
     if not isinstance(profile, str): raise ValueError('Invalid profile')
     resolve_asr_profile(profile)
+    if profile == 'local-multilingual':
+        from services.runtime.local_asr import worker_config
+        worker_config(settings)
     for key in ('whisper', 'whisper_compute_type', 'ollama'):
         value = settings.get('models', {}).get(key)
         if value is not None and (not isinstance(value, str) or not value.strip()):

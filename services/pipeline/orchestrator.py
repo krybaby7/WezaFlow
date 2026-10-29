@@ -142,10 +142,14 @@ class PipelineOrchestrator:
         )
 
     def _diagnostics(self) -> dict[str, Any]:
+        diagnostics = {}
         vad_stats = getattr(self.vad, "last_stats", None)
         if isinstance(vad_stats, dict):
-            return {"vad": dict(vad_stats)}
-        return {}
+            diagnostics['vad'] = dict(vad_stats)
+        editing = getattr(self.formatter, 'last_diagnostics', None)
+        if isinstance(editing, dict):
+            diagnostics['editing'] = dict(editing)
+        return diagnostics
 
     def inject_result(self, result: PipelineResult) -> None:
         raise RuntimeError("Automatic insertion is disabled until M2")

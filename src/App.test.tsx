@@ -204,6 +204,63 @@ describe("App", () => {
     expect(saveSettings.mock.calls[0][0].runtime.system_audio_duck_volume).toBe(12);
   });
 
+  it("switches to experimental local multilingual with auto language and local defaults", async () => {
+    const client = fakeClient();
+    render(<App client={client} />);
+    await userEvent.click(await screen.findByRole("tab", {name: "Dictation"}));
+    fireEvent.change(screen.getByLabelText("ASR profile"), {target: {value: "local-multilingual"}});
+    expect(screen.getByLabelText("Language")).toHaveValue("auto");
+    for (const name of ["English (en)", "Arabic (ar)", "French (fr)"]) {
+      expect(screen.getByRole("option", {name})).not.toBeDisabled();
+    }
+    expect(screen.getByLabelText("Local model folder")).toHaveValue("");
+    expect(screen.getByLabelText("Local device")).toHaveValue("cuda");
+    expect(screen.getByLabelText("Local CPU threads")).toHaveValue(2);
+    await userEvent.click(screen.getByRole("button", {name: "Save settings"}));
+    await waitFor(() => expect(client.saveSettings).toHaveBeenCalledWith(expect.objectContaining({
+      local_asr: expect.objectContaining({compute_type: "int8_float16", startup_timeout_seconds: 90})
+    }), true));
+  });
+
+  it("preserves local hidden timeouts and unrelated settings while editing setup", async () => {
+    const base = await fakeClient().getSettings();
+    const local = {snapshot_path: "old", runtime_manifest_path: "old.json", device: "cuda" as const,
+      compute_type: "custom", cpu_threads: 2, startup_timeout_seconds: 111, decode_timeout_seconds: 77,
+      idle_timeout_seconds: 60, reap_timeout_seconds: 9};
+    const client = fakeClient({getSettings: vi.fn(async () => ({...base, custom: "keep", local_asr: local,
+      runtime: {...base.runtime, profile: "local-multilingual", language: "ar"}}))});
+    render(<App client={client} />);
+    await userEvent.click(await screen.findByRole("tab", {name: "Dictation"}));
+    expect(screen.getByLabelText("Language")).toHaveValue("ar");
+    fireEvent.change(screen.getByLabelText("Local model folder"), {target: {value: "C:/model"}});
+    fireEvent.change(screen.getByLabelText("GPU runtime manifest (optional)"), {target: {value: "C:/runtime.json"}});
+    fireEvent.change(screen.getByLabelText("Worker idle seconds"), {target: {value: "0"}});
+    fireEvent.change(screen.getByLabelText("Local device"), {target: {value: "cpu"}});
+    await userEvent.click(screen.getByRole("button", {name: "Save settings"}));
+    await waitFor(() => expect(client.saveSettings).toHaveBeenCalledWith(expect.objectContaining({custom: "keep",
+      models: base.models, local_asr: {...local, snapshot_path: "C:/model", runtime_manifest_path: "C:/runtime.json",
+        device: "cpu", compute_type: "int8", idle_timeout_seconds: 0}}), false));
+    fireEvent.change(screen.getByLabelText("Local device"), {target: {value: "cuda"}});
+    await userEvent.click(screen.getByRole("button", {name: "Save settings"}));
+    await waitFor(() => expect(client.saveSettings).toHaveBeenLastCalledWith(expect.objectContaining({
+      local_asr: expect.objectContaining({compute_type: "int8_float16"})}), false));
+  });
+
+  it.each([
+    ["STARTING", "Local speech worker: preparing. Dictation is not ready yet."],
+    ["READY", "Local speech worker: ready."],
+    ["STOPPED", "Local speech worker: unloaded. It will prepare on the next dictation."],
+    ["REAPING", "Local speech worker: unloading. Dictation is not ready yet."],
+    ["UNHEALTHY", "Local speech worker: unhealthy. Check diagnostics before retrying."]
+  ])("shows %s worker status separately from dictation state", async (state, note) => {
+    const base = await fakeClient().getStatus();
+    render(<App client={fakeClient({getStatus: vi.fn(async () => ({...base,
+      profile: "local-multilingual", asr_worker: {state, busy: false}}))})} />);
+    expect(await screen.findByText(note)).toBeInTheDocument();
+    expect(screen.getByText("idle")).toBeInTheDocument();
+    expect(screen.queryByText("Ready to dictate")).not.toBeInTheDocument();
+  });
+
   it("shows the distil small English ASR profile in dictation settings", async () => {
     render(<App client={fakeClient()} />);
 

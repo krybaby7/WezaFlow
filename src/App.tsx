@@ -21,6 +21,7 @@ import {
   type CorrectionPair,
   type DependencyStatus,
   type LearningSuggestion,
+  type LocalAsrSettings,
   type PendingCorrection,
   RuntimeApiClient,
   type RuntimeStatus,
@@ -93,7 +94,8 @@ const ASR_PROFILE_OPTIONS: AsrProfileOption[] = [
   { value: "snappy", label: "snappy", supportedLanguages: ["en"] },
   { value: "balanced", label: "balanced", supportedLanguages: ["en"] },
   { value: "quality", label: "quality (English only)", supportedLanguages: ["en"] },
-  { value: "distil-small-en", label: "distil-small-en", supportedLanguages: ["en"] }
+  { value: "distil-small-en", label: "distil-small-en", supportedLanguages: ["en"] },
+  { value: "local-multilingual", label: "Local multilingual (experimental)", supportedLanguages: ["auto", "en", "ar", "fr"] }
 ];
 
 const LANGUAGE_OPTIONS = [
@@ -104,6 +106,12 @@ const LANGUAGE_OPTIONS = [
   { value: "de", label: "German (de)" },
   { value: "es", label: "Spanish (es)" }
 ] as const;
+
+const DEFAULT_LOCAL_ASR: LocalAsrSettings = {
+  snapshot_path: "", runtime_manifest_path: "", device: "cuda", compute_type: "int8_float16",
+  cpu_threads: 2, startup_timeout_seconds: 90, decode_timeout_seconds: 60,
+  idle_timeout_seconds: 60, reap_timeout_seconds: 5
+};
 
 const DEFAULT_CLIENT = new RuntimeApiClient();
 
@@ -631,6 +639,18 @@ function LearningSuggestions({ suggestions }: { suggestions: LearningSuggestion[
   );
 }
 
+function localWorkerNote(worker: NonNullable<RuntimeStatus["asr_worker"]>): string {
+  switch (worker.state.toUpperCase()) {
+    case "STARTING": return "Local speech worker: preparing. Dictation is not ready yet.";
+    case "READY": return worker.busy ? "Local speech worker: busy." : "Local speech worker: ready.";
+    case "STOPPED":
+    case "UNLOADED": return "Local speech worker: unloaded. It will prepare on the next dictation.";
+    case "REAPING": return "Local speech worker: unloading. Dictation is not ready yet.";
+    case "UNHEALTHY": return "Local speech worker: unhealthy. Check diagnostics before retrying.";
+    default: return `Local speech worker: ${worker.state}. Readiness is unconfirmed.`;
+  }
+}
+
 function StatusPanel({
   status,
   dependencies,
@@ -664,6 +684,8 @@ function StatusPanel({
           <dt>Quality fallback</dt>
           <dd>Unavailable during the safety rebuild</dd>
         </dl>
+        {status?.asr_worker && <p role="status">{localWorkerNote(status.asr_worker)}</p>}
+        {status?.asr_worker?.last_error && <p role="alert">{status.asr_worker.last_error}</p>}
         {status?.last_error && <p role="alert">{status.last_error}</p>}
         <p>Automatic insertion and command editing are unavailable during the safety rebuild.</p>
         {status?.result && <section aria-label="Result recovery">
@@ -862,6 +884,10 @@ function DictationPanel({
   onSettings: (settings: Settings) => void;
   onSave: () => void;
 }) {
+  const localAsr = settings.local_asr ?? DEFAULT_LOCAL_ASR;
+  function updateLocalAsr(update: Partial<LocalAsrSettings>) {
+    onSettings({...settings, local_asr: {...localAsr, ...update}});
+  }
   const language = coerceLanguageForProfile(
     settings.runtime.language,
     settings.runtime.profile
@@ -870,7 +896,7 @@ function DictationPanel({
   return (
     <div className="section">
       <h2>Dictation</h2>
-      <p>Command editing, automatic insertion, quality fallback, and background model warmup are unavailable during the safety rebuild. Current bundled profiles support English only.</p>
+      <p>Command editing, automatic insertion, quality fallback, and background model warmup are unavailable during the rebuild. Existing CPU profiles support English; the experimental local profile supports evaluating multilingual models.</p>
       <div className="grid two">
         <label>
           ASR profile
@@ -879,10 +905,13 @@ function DictationPanel({
             onChange={(event) =>
               onSettings({
                 ...settings,
+                ...(event.target.value === "local-multilingual" && !settings.local_asr
+                  ? {local_asr: {...DEFAULT_LOCAL_ASR}} : {}),
                 runtime: {
                   ...settings.runtime,
                   profile: event.target.value,
-                  language: coerceLanguageForProfile(settings.runtime.language, event.target.value)
+                  language: event.target.value === "local-multilingual" && settings.runtime.profile !== "local-multilingual"
+                    ? "auto" : coerceLanguageForProfile(settings.runtime.language, event.target.value)
                 }
               })
             }
@@ -917,6 +946,33 @@ function DictationPanel({
           </select>
         </label>
       </div>
+      {settings.runtime.profile === "local-multilingual" && <fieldset>
+        <legend>Local multilingual setup</legend>
+        <p>Requires local model files. Paths are checked when saving; model readiness is checked on first dictation. Recognition quality is still being evaluated. Local grammar editing is not connected yet, so this profile preserves the raw transcript.</p>
+        <div className="grid two">
+          <label>Local model folder
+            <input value={localAsr.snapshot_path} onChange={(event) => updateLocalAsr({snapshot_path: event.target.value})} />
+          </label>
+          <label>GPU runtime manifest (optional)
+            <input value={localAsr.runtime_manifest_path} onChange={(event) => updateLocalAsr({runtime_manifest_path: event.target.value})} />
+          </label>
+          <label>Local device
+            <select value={localAsr.device} onChange={(event) => {
+              const device = event.target.value as LocalAsrSettings["device"];
+              updateLocalAsr({device, ...(device !== localAsr.device ? {compute_type: device === "cpu" ? "int8" : "int8_float16"} : {})});
+            }}>
+              <option value="cuda">GPU (CUDA)</option><option value="cpu">CPU</option>
+            </select>
+          </label>
+          <label>Local CPU threads
+            <input type="number" min="1" step="1" value={localAsr.cpu_threads} onChange={(event) => updateLocalAsr({cpu_threads: Number(event.target.value)})} />
+          </label>
+          <label>Worker idle seconds
+            <input type="number" min="0" step="1" value={localAsr.idle_timeout_seconds} onChange={(event) => updateLocalAsr({idle_timeout_seconds: Number(event.target.value)})} />
+          </label>
+        </div>
+        <p>Idle seconds controls how long the worker keeps the model loaded after dictation. Set 0 for no retention.</p>
+      </fieldset>}
       <div className="toggles">
         <label>
           <input

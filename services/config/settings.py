@@ -32,6 +32,17 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "whisper_speculative_cpu_threads": 2,
         "ollama": "qwen3.5:4b",
     },
+    "local_asr": {
+        "snapshot_path": "",
+        "runtime_manifest_path": "",
+        "device": "cuda",
+        "compute_type": "int8_float16",
+        "cpu_threads": 2,
+        "startup_timeout_seconds": 90,
+        "decode_timeout_seconds": 60,
+        "idle_timeout_seconds": 60,
+        "reap_timeout_seconds": 5,
+    },
     "hotkeys": {
         "dictation": ["Ctrl+Alt+Space"],
         "command_mode": ["Ctrl+Alt+E"],

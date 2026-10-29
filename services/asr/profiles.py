@@ -38,6 +38,14 @@ class AsrProfile:
 DEFAULT_ASR_PROFILE = "low-impact"
 
 ASR_PROFILES: dict[str, AsrProfile] = {
+    "local-multilingual": AsrProfile(
+        name="local-multilingual",
+        model_name="local-snapshot",
+        compute_type="int8_float16",
+        cpu_threads=2,
+        speculative_cpu_threads=2,
+        speculative_enabled=False,
+    ),
     "low-impact": AsrProfile(
         name="low-impact",
         model_name="small.en",

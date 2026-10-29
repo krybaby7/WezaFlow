@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import secrets
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from threading import Event, Thread, RLock
 
@@ -44,6 +45,7 @@ class RuntimeApiState:
     profile: str = DEFAULT_ASR_PROFILE
     quiet_mode: bool = False
     quality_fallback: bool = False
+    asr_service: Any | None = None
 
     @property
     def settings_path(self) -> Path:
@@ -90,6 +92,9 @@ class RuntimeApiState:
         effective = load_settings(self.settings_path)
         model = effective["models"]["whisper"]
         threads = effective["models"]["whisper_cpu_threads"]
+        if self.profile == 'local-multilingual':
+            model = effective['local_asr']['snapshot_path']
+            threads = effective['local_asr']['cpu_threads']
         return (
             f"Configured runtime: profile={self.profile} model={model} "
             f"threads={threads} quiet={self.quiet_mode}"
@@ -106,6 +111,7 @@ def create_app(
     engine_token: str | None = None,
     engine_id: str | None = None,
     controller_factory: Callable | None = None,
+    asr_service: Any | None = None,
 ):
     try:
         from fastapi import FastAPI, HTTPException, Query
@@ -123,13 +129,34 @@ def create_app(
     instance_id = engine_id or os.environ.get("WEZZA_ENGINE_ID")
     if not token or not instance_id:
         raise RuntimeError("Explicit per-run engine credentials are required")
+    if asr_service is None:
+        from services.asr.worker import AsrWorkerService
+        asr_service = AsrWorkerService()
+    state.asr_service = asr_service
     controller = SerializedSessionController(
         factory=controller_factory or (lambda settings: _create_session_adapters(state, settings)),
         settings_provider=lambda: load_settings(state.settings_path), engine_id=instance_id,
     )
     identity = {"application_id": "wezza", "protocol_version": PROTOCOL_VERSION, "engine_id": instance_id}
-    app = FastAPI(title="LocalFlow Runtime API", version="0.1.0")
+    def close_resources():
+        controller.close()
+        reaped = state.asr_service.close(timeout_seconds=5)
+        settled = controller.wait_for_worker(2)
+        return reaped and settled
+
+    @asynccontextmanager
+    async def lifespan(app):
+        try:
+            yield
+        finally:
+            from starlette.concurrency import run_in_threadpool
+            if not await run_in_threadpool(close_resources):
+                raise RuntimeError('Local inference worker cleanup incomplete')
+
+    app = FastAPI(title="LocalFlow Runtime API", version="0.1.0", lifespan=lifespan)
     app.state.controller = controller
+    app.state.asr_service = asr_service
+    app.state.close_resources = close_resources
     app.state.shutdown_requested = Event()
 
     @app.middleware("http")
@@ -163,7 +190,8 @@ def create_app(
         settings = controller.settings_snapshot()
         runtime = settings.get("runtime", {})
         return {**controller.snapshot(), "profile": runtime.get("profile", DEFAULT_ASR_PROFILE),
-                "quiet_mode": runtime.get("quiet_mode", False), "quality_fallback": False}
+                "quiet_mode": runtime.get("quiet_mode", False), "quality_fallback": False,
+                "asr_worker": state.asr_service.snapshot()}
 
     @app.post("/runtime/start")
     def start_runtime(payload: dict[str, Any]) -> dict[str, Any]:
@@ -187,9 +215,10 @@ def create_app(
 
     @app.post("/runtime/shutdown")
     def shutdown_runtime() -> dict[str, Any]:
-        controller.close()
+        if not close_resources():
+            raise HTTPException(status_code=503, detail='Local inference worker cleanup incomplete; retry shutdown')
         app.state.shutdown_requested.set()
-        return {"status": "ok", **identity}
+        return {"status": "ok", "resources_reaped": True, **identity}
 
     @app.get("/runtime/check")
     def check_runtime() -> dict[str, Any]:
@@ -256,7 +285,7 @@ def create_app(
             with settings_lock:
                 saved = persist_settings(state.settings_path, settings)
                 controller.update_settings(saved)
-        except ValueError as exc:
+        except (ValueError, TypeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"status": "ok", "settings": saved}
 
@@ -449,8 +478,8 @@ def main() -> None:
     try:
         server.run()
     finally:
-        app.state.controller.close()
-        app.state.controller.wait_for_worker(2)
+        if not app.state.close_resources():
+            raise RuntimeError('Local inference worker cleanup incomplete')
 
 
 
@@ -460,14 +489,24 @@ def _create_session_adapters(state: RuntimeApiState, settings: dict):
     from services.pipeline.factory import build_pipeline
     runtime = settings.get("runtime", {})
     profile = resolve_asr_profile(runtime.get("profile", DEFAULT_ASR_PROFILE))
+    overrides = {}
+    if profile.name == 'local-multilingual':
+        from services.runtime.local_asr import worker_config, RawRecoveryFormatter
+        from services.snippets.engine import SnippetEngine
+        if state.asr_service is None:
+            raise RuntimeError('Local inference service is unavailable')
+        overrides = {'transcriber': state.asr_service.transcriber(worker_config(settings)),
+                     'formatter': RawRecoveryFormatter(), 'snippets': SnippetEngine([])}
     pipeline = build_pipeline(root=state.root, settings=settings,
                               use_ollama=bool(runtime.get("use_ollama", False)),
                               quiet_mode=bool(runtime.get("quiet_mode", False)),
-                              **profile.pipeline_kwargs())
+                              **profile.pipeline_kwargs(), **overrides)
     audio = settings["audio"]
     recorder = AudioRecorder.microphone(sample_rate=audio["sample_rate"], blocksize=audio["blocksize"])
     return recorder, pipeline
 
 
 if __name__ == "__main__":
+    from multiprocessing import freeze_support
+    freeze_support()
     main()
