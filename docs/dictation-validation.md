@@ -243,3 +243,41 @@ owner dies between wrapper creation and job assignment, the unopened gate bounds
 wrapper exit by startup timeout and no native model server is launched. Fixture
 tests exercise both windows. No offline network-denial or energy qualification is
 implied by binding the server to loopback and disabling proxies/redirects.
+
+## Read-only Windows editor capability probe
+
+This explicit diagnostic helps choose an insertion adapter for an actual focused
+editor. It is not integrated into normal dictation and does not qualify insertion.
+It never changes focus, writes text, sends keystrokes or accesses the clipboard.
+It may inspect up to 2,000 characters through a bounded native text API, but emits
+only counts, identities and capability facts: no names, titles, URLs or text.
+Unsupported password properties remain unknown and prohibit text observation.
+
+From the project root, start this diagnostic and focus a non-sensitive test field
+during the five-second delay:
+
+```powershell
+Start-Sleep -Seconds 5
+./.venv/Scripts/python.exe -m services.injection.windows_probe --probe-focused-editor --timeout 5
+```
+
+The operation timeout is followed by up to two seconds of cleanup. Output reports
+`ok`, `timeout`, `helper_failed`, `cleanup_incomplete` or `unsupported_platform`.
+An `ok` result means a diagnostic response arrived; unknown capabilities may remain.
+`cleanup_complete` proves the owned wrapper, reader and assigned job tree settled.
+The utility is intended for one explicit operation at a time, not background polling.
+
+Record the app/build and the specific editor separately when collecting a capability
+matrix. A Comet chat field, its internal assistant, Google Docs and Google Sheets
+are distinct rows. HWND/process identity alone does not identify a browser editor.
+`coherence: stable` means before/after sampled identities matched; it cannot exclude
+an intervening change or establish an atomic write target. `uia_same_process` merely
+compares process IDs; different processes can legitimately participate in one UI.
+Selection observation reports range-count availability, not exact selected text,
+caret offsets or selection provenance. Pattern flags do not authorize writing.
+
+Automated checks use synthetic providers and a hidden native fixture. On this PC
+the hidden fixture exposes a Pane/runtime ID with no usable text/value patterns;
+that result is not evidence for Edit controls or the user's actual apps. Those rows
+remain unmeasured. The existing automatic-insertion gate stays disabled until a
+writer is selected and validated against target, clipboard and delivery tests.
