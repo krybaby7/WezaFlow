@@ -1,4 +1,7 @@
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from services.pipeline.models import AppContext, PipelineResult
 
@@ -40,14 +43,31 @@ class PipelineServerTests(unittest.TestCase):
     def test_create_app_exposes_runtime_status_routes(self):
         if TestClient is None:
             self.skipTest("fastapi is not installed in this Python environment")
-        from services.pipeline_server import create_app
+        from services.config.settings import load_settings, save_settings
+        from services.pipeline_server import create_app, create_runtime_api_app
 
-        client = TestClient(create_app(pipeline=object()))
+        for profile, quality_fallback in (("low-impact", False), ("snappy", True)):
+            with self.subTest(profile=profile, quality_fallback=quality_fallback):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    settings_path = root / "config" / "settings.yaml"
+                    settings_path.parent.mkdir()
+                    settings = load_settings(settings_path)
+                    settings["runtime"].update(
+                        profile=profile, quality_fallback=quality_fallback
+                    )
+                    save_settings(settings_path, settings)
+                    with patch(
+                        "services.pipeline_server.create_runtime_api_app",
+                        side_effect=lambda: create_runtime_api_app(root=root),
+                    ):
+                        client = TestClient(create_app(pipeline=object()))
+                    payload = client.get("/status").json()
 
-        payload = client.get("/status").json()
+                self.assertEqual(payload["status"], "ok")
+                self.assertEqual(payload["profile"], profile)
+                self.assertEqual(payload["quality_fallback"], quality_fallback)
 
-        self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["profile"], "low-impact")
 
 
 if __name__ == "__main__":

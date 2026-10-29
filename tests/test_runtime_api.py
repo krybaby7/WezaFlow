@@ -194,20 +194,32 @@ class RuntimeApiTests(unittest.TestCase):
             self.skipTest("fastapi is not installed in this Python environment")
 
     def test_status_reports_runtime_envelope(self):
+        from services.config.settings import load_settings, save_settings
         from services.runtime.api import create_app
 
-        session = FakeRuntimeSession()
-        client = TestClient(create_app(session=session, find_spec=lambda _name: None))
+        for profile, quality_fallback in (("low-impact", False), ("snappy", True)):
+            with self.subTest(profile=profile, quality_fallback=quality_fallback):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    settings_path = root / "config" / "settings.yaml"
+                    settings_path.parent.mkdir()
+                    settings = load_settings(settings_path)
+                    settings["runtime"].update(
+                        profile=profile, quiet_mode=False, quality_fallback=quality_fallback
+                    )
+                    save_settings(settings_path, settings)
+                    client = TestClient(create_app(
+                        root=root, session=FakeRuntimeSession(), find_spec=lambda _name: None
+                    ))
+                    payload = client.get("/status").json()
 
-        payload = client.get("/status").json()
-
-        self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["state"], "idle")
-        self.assertEqual(payload["mode"], "idle")
-        self.assertEqual(payload["profile"], "low-impact")
-        self.assertFalse(payload["quiet_mode"])
-        self.assertFalse(payload["quality_fallback"])
-        self.assertIsNone(payload["last_error"])
+                self.assertEqual(payload["status"], "ok")
+                self.assertEqual(payload["state"], "idle")
+                self.assertEqual(payload["mode"], "idle")
+                self.assertEqual(payload["profile"], profile)
+                self.assertFalse(payload["quiet_mode"])
+                self.assertEqual(payload["quality_fallback"], quality_fallback)
+                self.assertIsNone(payload["last_error"])
 
     def test_runtime_api_allows_tauri_cors_preflight(self):
         from services.runtime.api import create_app
