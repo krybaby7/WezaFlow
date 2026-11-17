@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import math
+import sys
 from array import array
 from dataclasses import dataclass
 import threading
@@ -9,6 +10,29 @@ import wave
 from collections.abc import Callable, Iterable
 from typing import Any
 
+# False until first use; None when numpy is unavailable. Spawned workers import this
+# package, so numpy must never be imported at module load.
+_np_module: Any = False
+
+
+def _numpy():
+    global _np_module
+    if _np_module is False:
+        try:
+            import numpy
+        except ImportError:  # Pure-Python fallback keeps capture working without numpy.
+            numpy = None
+        _np_module = numpy
+    return _np_module
+
+
+def _loaded_numpy():
+    # The audio callback must not pay for a first import; an ndarray block implies numpy is loaded.
+    return _numpy() if 'numpy' in sys.modules else None
+
+
+# Largest accepted magnitude, compared in float64 exactly as the Python path does.
+_SAMPLE_LIMIT = 3.402823466e38
 
 StreamFactory = Callable[[Callable[..., None], int, int], Any]
 
@@ -164,16 +188,21 @@ class AudioRecorder:
             self._terminal('input_overflow')
             return
         try:
-            samples = _flatten_mono_samples(indata)
-            if any(not math.isfinite(value) or abs(value) > 3.402823466e38 for value in samples):
-                raise ValueError('invalid samples')
+            block = _mono_float32_block(indata)
+            if block is None:
+                samples = _flatten_mono_samples(indata)
+                if any(not math.isfinite(value) or abs(value) > _SAMPLE_LIMIT for value in samples):
+                    raise ValueError('invalid samples')
         except (ValueError, TypeError, OverflowError, IndexError):
             self._terminal('invalid_audio')
             return
         if self._terminal_code not in (None, 'duration_limit'):
             return
         room = self.max_samples - len(self._frames)
-        self._frames.extend(samples[:room])
+        if block is not None:
+            self._frames.frombytes(block[:room].tobytes())
+        else:
+            self._frames.extend(samples[:room])
         self._sample_count = len(self._frames)
         if self._sample_count == self.max_samples:
             self._terminal('duration_limit')
@@ -197,18 +226,14 @@ class AudioRecorder:
     def float_samples_to_wav_bytes(
         samples: Iterable[float], sample_rate: int = 16000
     ) -> bytes:
-        pcm = bytearray()
-        for sample in samples:
-            clipped = max(-1.0, min(1.0, float(sample)))
-            value = int(round(clipped * 32767))
-            pcm.extend(value.to_bytes(2, "little", signed=True))
+        pcm = _float_samples_to_pcm16(samples)
 
         buffer = io.BytesIO()
         with wave.open(buffer, "wb") as wav:
             wav.setnchannels(1)
             wav.setsampwidth(2)
             wav.setframerate(sample_rate)
-            wav.writeframes(bytes(pcm))
+            wav.writeframes(pcm)
         return buffer.getvalue()
 
 
@@ -225,6 +250,56 @@ def create_sounddevice_stream(callback: Callable[..., None], sample_rate: int, b
         callback=callback,
         blocksize=blocksize,
     )
+
+
+def _mono_float32_block(indata):
+    """Validated float32 copy of a numeric mono ndarray block, else None for the Python path.
+
+    Raises ValueError for non-finite or out-of-range samples, like the Python path.
+    """
+    np = _loaded_numpy()
+    if np is None or not isinstance(indata, np.ndarray) or indata.dtype.kind not in 'fiub':
+        return None
+    if indata.ndim == 2 and indata.shape[1] == 1:
+        flat = indata[:, 0]
+    elif indata.ndim == 1:
+        flat = indata
+    else:
+        return None
+    values = flat.astype(np.float64)
+    # NaN compares False, so this rejects NaN, infinities and out-of-range values.
+    if not bool(np.all(np.abs(values) <= _SAMPLE_LIMIT)):
+        raise ValueError('invalid samples')
+    return values.astype(np.float32)
+
+
+def _float_samples_to_pcm16(samples: Iterable[float]) -> bytes:
+    np = _numpy()
+    values = _numeric_vector(np, samples)
+    if values is None:
+        pcm = bytearray()
+        for sample in samples:
+            clipped = max(-1.0, min(1.0, float(sample)))
+            value = int(round(clipped * 32767))
+            pcm.extend(value.to_bytes(2, "little", signed=True))
+        return bytes(pcm)
+    # max(-1.0, min(1.0, nan)) is 1.0 in the Python path.
+    values = np.where(np.isnan(values), 1.0, np.clip(values, -1.0, 1.0))
+    # rint is round-half-to-even on float64, matching Python round().
+    return np.rint(values * 32767).astype('<i2').tobytes()
+
+
+def _numeric_vector(np, samples):
+    """float64 vector for flat numeric sequences, else None so callers use the Python path."""
+    if np is None or not isinstance(samples, (list, tuple, array, np.ndarray)):
+        return None
+    try:
+        values = np.asarray(samples)
+    except (ValueError, TypeError, OverflowError):
+        return None
+    if values.ndim != 1 or values.dtype.kind not in 'fiub':
+        return None
+    return values.astype(np.float64)
 
 
 def _flatten_mono_samples(indata) -> list[float]:

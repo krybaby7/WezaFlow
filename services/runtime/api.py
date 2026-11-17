@@ -476,6 +476,42 @@ def _pending_correction_value(item: Any, key: str) -> Any:
     return getattr(item, key, None)
 
 
+def warm_local_models(asr_service: Any, editor_service: Any, settings: Any) -> list[Thread]:
+    """Begin loading the local models in the background; never blocks or raises."""
+    try:
+        runtime = settings.get("runtime", {})
+        if runtime.get("profile") != "local-multilingual":
+            return []
+    except Exception:
+        return []
+
+    def warm_asr():
+        try:
+            from services.runtime.local_asr import worker_config
+            asr_service.warm(worker_config(settings))
+        except Exception:
+            pass
+
+    def warm_editor():
+        try:
+            editor_service.warm(settings)
+        except Exception:
+            pass
+
+    threads = []
+    for service, target, name in ((asr_service, warm_asr, "wezza-asr-warm"),
+                                  (editor_service, warm_editor, "wezza-editor-warm")):
+        if not callable(getattr(service, "warm", None)):
+            continue
+        try:
+            thread = Thread(target=target, name=name, daemon=True)
+            thread.start()
+            threads.append(thread)
+        except Exception:
+            pass
+    return threads
+
+
 def main() -> None:
     try:
         import uvicorn
@@ -483,6 +519,8 @@ def main() -> None:
         raise RuntimeError("uvicorn is required to run the LocalFlow runtime API") from exc
 
     app = create_app()
+    warm_local_models(app.state.asr_service, app.state.editor_service,
+                      app.state.controller.settings_snapshot())
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=8765))
     def watch_shutdown():
         app.state.shutdown_requested.wait()
@@ -504,12 +542,16 @@ def _create_session_adapters(state: RuntimeApiState, settings: dict):
     profile = resolve_asr_profile(runtime.get("profile", DEFAULT_ASR_PROFILE))
     overrides = {}
     if profile.name == 'local-multilingual':
-        from services.runtime.local_asr import worker_config
+        from services.runtime.local_asr import RawRecoveryFormatter, worker_config
         from services.snippets.engine import SnippetEngine
         if state.asr_service is None:
             raise RuntimeError('Local inference service is unavailable')
+        formatter = (RawRecoveryFormatter() if state.editor_service is None
+                     else state.editor_service.formatter(settings))
         overrides = {'transcriber': state.asr_service.transcriber(worker_config(settings)),
-                     'formatter': state.editor_service.formatter(settings), 'snippets': SnippetEngine([])}
+                     'formatter': formatter, 'snippets': SnippetEngine([])}
+        # Load while the user is still speaking; the recorder starts as soon as we return.
+        warm_local_models(state.asr_service, state.editor_service, settings)
     elif state.editor_service is not None:
         # Changing away from the local profile releases its owned editor too.
         state.editor_service.formatter({'local_editor': {'enabled': False}})

@@ -42,6 +42,7 @@ import {
   configureDesktopSettings,
   getDesktopWindowLabel,
   listenToRecordingBarState,
+  startDesktopRuntime,
   type RecordingBarStatePayload
 } from "./lib/tauri";
 import wezaLogo from "./assets/Logo-no-bg.png";
@@ -128,6 +129,11 @@ const RECORDING_BAR_LABELS: Record<RecordingBarStatePayload["state"], string> = 
   error: "Error"
 };
 
+const RECORDING_BAR_DELIVERY_LABELS: Record<NonNullable<RecordingBarStatePayload["delivery"]>, string> = {
+  pasted: "Pasted",
+  clipboard: "Copied to clipboard"
+};
+
 function supportedLanguagesForProfile(profile: string): readonly string[] | null {
   return ASR_PROFILE_OPTIONS.find((item) => item.value === profile)?.supportedLanguages ?? null;
 }
@@ -187,6 +193,7 @@ function SettingsApp({ client = DEFAULT_CLIENT }: { client?: RuntimeClient }) {
   const [pendingCorrected, setPendingCorrected] = useState("");
   const [snippetTrigger, setSnippetTrigger] = useState("");
   const [snippetExpansion, setSnippetExpansion] = useState("");
+  const [initializingRuntime, setInitializingRuntime] = useState(true);
   const [message, setMessage] = useState("Loading runtime state...");
   const [error, setError] = useState<string | null>(null);
   const [pendingDesktopSettings, setPendingDesktopSettings] = useState<Settings | null>(null);
@@ -203,7 +210,7 @@ function SettingsApp({ client = DEFAULT_CLIENT }: { client?: RuntimeClient }) {
   );
 
   useEffect(() => {
-    void refreshAll();
+    void refreshAll(true);
   }, []);
 
   useEffect(() => {
@@ -241,9 +248,12 @@ function SettingsApp({ client = DEFAULT_CLIENT }: { client?: RuntimeClient }) {
     });
   }, [status?.state, status?.busy, pendingDesktopSettings]);
 
-  async function refreshAll() {
+  async function refreshAll(startEngine = false) {
     try {
       setError(null);
+      if (startEngine) {
+        await startDesktopRuntime();
+      }
       const [
         nextStatus,
         nextSettings,
@@ -286,6 +296,10 @@ function SettingsApp({ client = DEFAULT_CLIENT }: { client?: RuntimeClient }) {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setMessage("Runtime API unavailable");
+    } finally {
+      if (startEngine) {
+        setInitializingRuntime(false);
+      }
     }
   }
 
@@ -422,7 +436,13 @@ function SettingsApp({ client = DEFAULT_CLIENT }: { client?: RuntimeClient }) {
             <p>{message}</p>
           </div>
         </div>
-        <button className="icon-button" type="button" onClick={refreshAll} aria-label="Refresh">
+        <button
+          className="icon-button"
+          type="button"
+          onClick={() => void refreshAll()}
+          disabled={initializingRuntime}
+          aria-label="Refresh"
+        >
           <RefreshCw size={18} />
         </button>
       </header>
@@ -537,19 +557,28 @@ function RecordingFeedbackBar() {
         return;
       }
       setBarState(payload);
+    }).catch(() => {
+      if (active) {
+        setBarState({
+          state: "error",
+          mode: "dictation",
+          message: "Recording status unavailable."
+        });
+      }
     });
     return () => {
       active = false;
-      void unlisten.then((removeListener) => removeListener());
+      void unlisten.then((removeListener) => removeListener?.());
     };
   }, []);
 
-  const label = RECORDING_BAR_LABELS[barState.state];
+  const delivery = barState.state === "ready" ? barState.delivery ?? null : null;
+  const label = delivery ? RECORDING_BAR_DELIVERY_LABELS[delivery] : RECORDING_BAR_LABELS[barState.state];
   const statusMark =
-    barState.state === "ready" ? "OK" : barState.state === "error" ? "!" : "ON";
+    barState.state === "ready" ? "OK" : barState.state === "error" ? "!" : "";
 
   return (
-    <main className={`recording-bar-root state-${barState.state}`}>
+    <main className={`recording-bar-root state-${barState.state}${delivery ? ` delivery-${delivery}` : ""}`}>
       <section className="recording-pill" role="status" aria-label="Recording feedback">
         <span className="recording-live-dot" aria-hidden="true" />
         <span className="recording-waveform" aria-hidden="true">
@@ -1008,7 +1037,9 @@ function DictationPanel({
       <fieldset>
         <legend>Automatic paste trial</legend>
         <label><input type="checkbox" checked={settings.runtime.experimental_automatic_paste ?? false} onChange={(event) => onSettings({...settings, runtime: {...settings.runtime, experimental_automatic_paste: event.target.checked}})} /> Enable experimental automatic paste</label>
-        <p>Uses Ctrl+V after dictation and leaves the result on your clipboard. Focus checks cannot prevent every race or detect every password field. Use ordinary, non-sensitive text fields and keep the caret still. Delivery is unverified; check the destination before trying again. Leave this off to use Copy result.</p>
+        <p>Pastes with Ctrl+V after dictation, then puts back what was on your clipboard unless you copy something else first. Dictated text is kept out of clipboard history. If the text cannot be pasted, it stays on the clipboard so you can press Ctrl+V yourself. Focus checks cannot prevent every race or detect every password field. Use ordinary, non-sensitive text fields and keep the caret still. Delivery is unverified; check the destination before trying again. Leave this off to use Copy result.</p>
+        <label><input type="checkbox" checked={settings.runtime.caret_shaping ?? true} disabled={!(settings.runtime.experimental_automatic_paste ?? false)} onChange={(event) => onSettings({...settings, runtime: {...settings.runtime, caret_shaping: event.target.checked}})} /> Fit dictation to surrounding text</label>
+        <p>Before pasting, looks at the text beside the cursor to fix capitals, spacing and the final full stop; that text is never saved or sent to the engine.</p>
       </fieldset>
       <div className="toggles">
         <label>

@@ -1,6 +1,22 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from typing import Any
+
+# False until first use; None when numpy is unavailable. Spawned workers import this
+# package, so numpy must never be imported at module load.
+_np_module: Any = False
+
+
+def _numpy():
+    global _np_module
+    if _np_module is False:
+        try:
+            import numpy
+        except ImportError:  # Pure-Python fallback keeps VAD working without numpy.
+            numpy = None
+        _np_module = numpy
+    return _np_module
 
 
 class VADFilter:
@@ -31,9 +47,14 @@ class VADFilter:
         if not samples:
             return None
 
+        magnitudes = _finite_magnitudes(samples)
         min_samples = int(self.sample_rate * self.min_duration_ms / 1000)
-        active_samples = sum(1 for sample in samples if abs(float(sample)) >= self.threshold)
-        max_abs = max((abs(float(sample)) for sample in samples), default=0.0)
+        if magnitudes is not None:
+            active_samples = int(_numpy().count_nonzero(magnitudes >= self.threshold))
+            max_abs = float(magnitudes.max())
+        else:
+            active_samples = sum(1 for sample in samples if abs(float(sample)) >= self.threshold)
+            max_abs = max((abs(float(sample)) for sample in samples), default=0.0)
         self.last_stats["max_abs"] = max_abs
         if active_samples < min_samples and max_abs < self.threshold:
             return None
@@ -46,16 +67,21 @@ class VADFilter:
                 }
             )
             return samples
-        return self._trim_with_padding(samples)
+        return self._trim_with_padding(samples, magnitudes)
 
-    def _trim_with_padding(self, samples: list[float]) -> list[float]:
+    def _trim_with_padding(self, samples: list[float], magnitudes=None) -> list[float]:
         first_active: int | None = None
         last_active: int | None = None
-        for index, sample in enumerate(samples):
-            if abs(float(sample)) >= self.trim_threshold:
-                if first_active is None:
-                    first_active = index
-                last_active = index
+        if magnitudes is not None:
+            active = _numpy().flatnonzero(magnitudes >= self.trim_threshold)
+            if len(active):
+                first_active, last_active = int(active[0]), int(active[-1])
+        else:
+            for index, sample in enumerate(samples):
+                if abs(float(sample)) >= self.trim_threshold:
+                    if first_active is None:
+                        first_active = index
+                    last_active = index
 
         if first_active is None or last_active is None:
             self.last_stats.update(
@@ -79,3 +105,23 @@ class VADFilter:
             }
         )
         return trimmed
+
+
+def _finite_magnitudes(samples: list[float]):
+    """float64 |samples| for flat finite numeric lists, else None for the Python path.
+
+    Non-finite values fall back so Python's max() and comparison ordering for NaN are kept.
+    """
+    np = _numpy()
+    if np is None:
+        return None
+    try:
+        values = np.asarray(samples)
+    except (ValueError, TypeError, OverflowError):
+        return None
+    if values.ndim != 1 or values.dtype.kind not in 'fiub':
+        return None
+    magnitudes = np.abs(values.astype(np.float64))
+    if not bool(np.all(np.isfinite(magnitudes))):
+        return None
+    return magnitudes

@@ -14,10 +14,14 @@ def worker_config(settings):
     manifest = values['runtime_manifest_path']
     if not isinstance(manifest, str):
         raise ValueError('local_asr.runtime_manifest_path must be text')
+    languages = values['languages']
+    # Session snapshots freeze lists to tuples.
+    if not isinstance(languages, (list, tuple)):
+        raise ValueError('local_asr.languages must be a list')
     return AsrWorkerConfig(
         snapshot=values['snapshot_path'], device=values['device'],
         compute_type=values['compute_type'], cpu_threads=values['cpu_threads'],
-        runtime_manifest=manifest or None,
+        runtime_manifest=manifest or None, languages=tuple(languages),
         **{name: values[name] for name in ('startup_timeout_seconds', 'decode_timeout_seconds',
                                           'idle_timeout_seconds', 'reap_timeout_seconds')},
     )

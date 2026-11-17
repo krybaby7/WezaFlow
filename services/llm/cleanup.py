@@ -231,9 +231,15 @@ def _capitalize_sentences(text: str) -> str:
 
 
 def _ensure_final_sentence_punctuation(text: str) -> str:
+    text = _drop_terminal_comma_artifact(text)
     if text and text[-1] not in ".!?":
         return f"{text}."
     return text
+
+
+def _drop_terminal_comma_artifact(text: str) -> str:
+    text = re.sub(r",\s*([.!?])$", r"\1", text)
+    return re.sub(r",\s*$", "", text).rstrip()
 
 
 def _last_match(pattern: re.Pattern[str], text: str) -> re.Match[str] | None:

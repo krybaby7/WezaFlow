@@ -7,6 +7,20 @@ from enum import Enum
 from urllib.parse import urlparse
 from typing import Any, Callable
 
+# False until first use; None when numpy is unavailable. Keeps numpy out of module load.
+_np_module: Any = False
+
+
+def _numpy():
+    global _np_module
+    if _np_module is False:
+        try:
+            import numpy
+        except ImportError:  # Pure-Python fallback keeps normalization working without numpy.
+            numpy = None
+        _np_module = numpy
+    return _np_module
+
 
 class RuntimeState(str, Enum):
     IDLE = "idle"
@@ -297,6 +311,9 @@ def wav_bytes_to_float_samples(wav_bytes: bytes) -> list[float]:
         frames = wav.readframes(wav.getnframes() + 1)
     if len(frames) != expected or len(frames) % 2:
         raise RuntimeError("Incomplete PCM WAV frames")
+    np = _numpy()
+    if np is not None:
+        return (np.frombuffer(frames, dtype='<i2').astype(np.float64) / 32768.0).tolist()
     return [int.from_bytes(frames[offset:offset+2], 'little', signed=True) / 32768.0
             for offset in range(0, len(frames), 2)]
 
@@ -307,7 +324,30 @@ def audio_stats(audio: Any) -> dict[str, int | float]:
         samples = list(audio)
     except TypeError:
         return {"sample_count": 0, "max_abs": 0.0}
+    magnitudes = _finite_magnitudes(samples)
+    if magnitudes is not None:
+        return {
+            "sample_count": len(samples),
+            "max_abs": float(magnitudes.max()) if len(magnitudes) else 0.0,
+        }
     return {
         "sample_count": len(samples),
         "max_abs": max((abs(float(sample)) for sample in samples), default=0.0),
     }
+
+
+def _finite_magnitudes(samples: list[Any]):
+    # Non-numeric or non-finite input keeps Python max() semantics, including its NaN ordering.
+    np = _numpy()
+    if np is None:
+        return None
+    try:
+        values = np.asarray(samples)
+    except (ValueError, TypeError, OverflowError):
+        return None
+    if values.ndim != 1 or values.dtype.kind not in 'fiub':
+        return None
+    magnitudes = np.abs(values.astype(np.float64))
+    if not bool(np.all(np.isfinite(magnitudes))):
+        return None
+    return magnitudes

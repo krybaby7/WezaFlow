@@ -69,6 +69,8 @@ class LocalEditorService:
         self._state = 'STOPPED'
         self._error = None
         self._provenance = None
+        self._owner = None
+        self._warm_waiter = False
 
     def backend(self, config):
         if not isinstance(config, LocalEditorConfig):
@@ -242,28 +244,94 @@ class LocalEditorService:
         finally:
             self._operation.release()
 
+    def _claim(self, owner):
+        with self._lock:
+            if not self._operation.acquire(False):
+                return False
+            self._owner = owner
+            return True
+
+    def _release(self):
+        with self._lock:
+            self._owner = None
+            self._operation.release()
+
+    def _claim_for_edit(self, config):
+        if self._claim('edit'):
+            return
+        # Only a single edit may wait behind an in-flight warm-up; any other
+        # overlap keeps the fail-fast contract.
+        with self._lock:
+            if self._owner != 'warm' or self._warm_waiter:
+                raise RuntimeError('local_worker_busy')
+            self._warm_waiter = True
+        try:
+            if not self._operation.acquire(timeout=config.startup_timeout+config.reap_timeout):
+                raise RuntimeError('local_worker_busy')
+            with self._lock:
+                self._owner = 'edit'
+        finally:
+            with self._lock:
+                self._warm_waiter = False
+
+    def _ensure_started(self, config):
+        """Reuse a ready worker for this exact config, otherwise replace it."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError('local_service_closed')
+            self._activity += 1
+            with open(config.manifest_path,'rb') as stream:
+                current_manifest = stream.read(65537)
+            if len(current_manifest)>65536 or hashlib.sha256(current_manifest).hexdigest() != config.manifest_sha256:
+                raise RuntimeError('local_manifest_changed')
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            replace = self._process is not None and (self._config != config or self._state != 'READY' or not self._process.is_alive())
+        if replace and not self._reap(config.reap_timeout):
+            raise RuntimeError('local_reap_incomplete')
+        if self._process is None:
+            self._start(config)
+
+    def _schedule_idle(self, config, generation):
+        # Caller holds self._lock.
+        self._timer = threading.Timer(config.idle_timeout, self._idle, args=(generation,self._activity))
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _record_failure(self, exc, config):
+        with self._lock:
+            self._error = str(exc) if str(exc) in {'local_worker_busy','local_operation_timeout','local_service_closed','local_reap_incomplete','local_tree_guarantee_unsupported'} else 'local_worker_failed'
+        self._reap(config.reap_timeout)
+
+    def warm(self, config):
+        """Start the worker for config without editing any text; never raises."""
+        if not isinstance(config, LocalEditorConfig) or not self._claim('warm'):
+            return False
+        try:
+            if self._closed:
+                return False
+            try:
+                self._ensure_started(config)
+                with self._lock:
+                    if self._closed or self._state != 'READY':
+                        raise RuntimeError('local_service_closed')
+                    self._schedule_idle(config, self._generation)
+                return True
+            except Exception as exc:
+                self._record_failure(exc, config)
+                return False
+        except Exception:
+            return False
+        finally:
+            self._release()
+
     def _edit(self, config, system, user):
         if not isinstance(system,str) or not isinstance(user,str) or len(system)+len(user) > MAX_REQUEST_CHARS:
             raise ValueError('local_request_invalid')
-        if not self._operation.acquire(False):
-            raise RuntimeError('local_worker_busy')
+        self._claim_for_edit(config)
         try:
-            with self._lock:
-                if self._closed:
-                    raise RuntimeError('local_service_closed')
-                self._activity += 1
-                with open(config.manifest_path,'rb') as stream:
-                    current_manifest = stream.read(65537)
-                if len(current_manifest)>65536 or hashlib.sha256(current_manifest).hexdigest() != config.manifest_sha256:
-                    raise RuntimeError('local_manifest_changed')
-                if self._timer is not None:
-                    self._timer.cancel()
-                    self._timer = None
-                replace = self._process is not None and (self._config != config or self._state != 'READY' or not self._process.is_alive())
-            if replace and not self._reap(config.reap_timeout):
-                raise RuntimeError('local_reap_incomplete')
-            if self._process is None:
-                self._start(config)
+            self._ensure_started(config)
             with self._lock:
                 self._state = 'EDITING'
                 generation = self._generation
@@ -276,17 +344,13 @@ class LocalEditorService:
                     raise RuntimeError('local_service_closed')
                 self._state = 'READY'
                 self._error = None
-                self._timer = threading.Timer(config.idle_timeout, self._idle, args=(generation,self._activity))
-                self._timer.daemon = True
-                self._timer.start()
+                self._schedule_idle(config, generation)
             return reply['content']
         except Exception as exc:
-            with self._lock:
-                self._error = str(exc) if str(exc) in {'local_worker_busy','local_operation_timeout','local_service_closed','local_reap_incomplete','local_tree_guarantee_unsupported'} else 'local_worker_failed'
-            self._reap(config.reap_timeout)
+            self._record_failure(exc, config)
             raise RuntimeError(self._error) from None
         finally:
-            self._operation.release()
+            self._release()
 
     def close(self, timeout_seconds=None):
         if timeout_seconds is not None and (type(timeout_seconds) not in (float,int) or not math.isfinite(timeout_seconds) or not 0 <= timeout_seconds <= 30):

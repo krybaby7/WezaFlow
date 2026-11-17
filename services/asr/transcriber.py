@@ -13,10 +13,15 @@ class FasterWhisperBackend:
         self,
         model_name: str = "large-v3-turbo",
         numpy_module: Any | None = None,
+        *,
+        allowed_languages: tuple[str, ...] | list[str] = (),
+        condition_on_previous_text: bool | None = None,
         **model_kwargs: Any,
     ) -> None:
         self.model_name = model_name
         self.model_kwargs = model_kwargs
+        self.allowed_languages = tuple(allowed_languages)
+        self.condition_on_previous_text = condition_on_previous_text
         self._numpy = numpy_module
         self._model = None
         self._model_lock = RLock()
@@ -36,11 +41,32 @@ class FasterWhisperBackend:
         _ = self.model
 
     def transcribe(self, audio, language=None, initial_prompt=None):
+        audio = self._coerce_audio(audio)
+        if language is None and self.allowed_languages:
+            language = self._restricted_language(audio)
+        options = {}
+        if self.condition_on_previous_text is not None:
+            options["condition_on_previous_text"] = self.condition_on_previous_text
         return self.model.transcribe(
-            self._coerce_audio(audio),
+            audio,
             language=language,
             initial_prompt=initial_prompt,
+            **options,
         )
+
+    def _restricted_language(self, audio):
+        """Most probable allowed language, or None to keep unrestricted detection."""
+        try:
+            _, _, probabilities = self.model.detect_language(audio)
+            best = None
+            for code, probability in probabilities:
+                if isinstance(code, str) and code.startswith("<|") and code.endswith("|>"):
+                    code = code[2:-2]
+                if code in self.allowed_languages and (best is None or probability > best[1]):
+                    best = (code, probability)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return None if best is None else best[0]
 
     def _coerce_audio(self, audio):
         if isinstance(audio, (list, tuple)):

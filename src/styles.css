@@ -182,11 +182,15 @@ pre {
 }
 
 .recording-live-dot {
-  background: #42df8b;
+  background: #9aa6a1;
   border-radius: 50%;
-  box-shadow: 0 0 0 4px rgba(66, 223, 139, 0.12);
   height: 8px;
   width: 8px;
+}
+
+.state-recording .recording-live-dot {
+  background: #42df8b;
+  box-shadow: 0 0 0 4px rgba(66, 223, 139, 0.12);
 }
 
 .state-processing .recording-live-dot {
@@ -194,7 +198,8 @@ pre {
   box-shadow: 0 0 0 4px rgba(212, 162, 76, 0.12);
 }
 
-.state-done .recording-live-dot {
+.state-done .recording-live-dot,
+.state-ready .recording-live-dot {
   background: #6ee7b7;
 }
 
@@ -212,12 +217,17 @@ pre {
 }
 
 .recording-waveform span {
-  animation: waveform-rise 760ms ease-in-out infinite;
-  background: linear-gradient(180deg, #e8f8ef, #52d28b);
+  animation: none;
+  background: #9aa6a1;
   border-radius: 999px;
   display: block;
-  height: 9px;
+  height: 7px;
   width: 3px;
+}
+
+.state-recording .recording-waveform span {
+  animation: waveform-rise 760ms ease-in-out infinite;
+  background: linear-gradient(180deg, #e8f8ef, #52d28b);
 }
 
 .recording-waveform span:nth-child(2) {
@@ -237,11 +247,14 @@ pre {
 }
 
 .state-processing .recording-waveform span {
-  animation-duration: 960ms;
+  animation: waveform-rise 960ms ease-in-out infinite;
   background: linear-gradient(180deg, #f8efd6, #d4a24c);
 }
 
 .state-done .recording-waveform span,
+.state-ready .recording-waveform span,
+.state-no_speech .recording-waveform span,
+.state-cancelled .recording-waveform span,
 .state-error .recording-waveform span {
   animation: none;
   height: 7px;
@@ -284,7 +297,8 @@ pre {
   color: #f1d79b;
 }
 
-.state-done .recording-status-mark {
+.state-done .recording-status-mark,
+.state-ready .recording-status-mark {
   color: #9af3c5;
 }
 

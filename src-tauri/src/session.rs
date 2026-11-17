@@ -93,6 +93,84 @@ mod tests {
         assert_eq!(c.cancel().unwrap().command_seq, 3);
         assert!(c.cancel().is_none());
     }
+    fn ms(start: std::time::Instant, millis: u64) -> std::time::Instant {
+        start + std::time::Duration::from_millis(millis)
+    }
+    #[test]
+    fn hold_past_tap_threshold_stops_on_release() {
+        let t = std::time::Instant::now();
+        let mut g = PressGesture::default();
+        assert_eq!(g.press("key:1", t), GestureAction::Start);
+        assert_eq!(g.press("key:1", ms(t, 100)), GestureAction::Ignore); // auto-repeat
+        assert_eq!(g.release("key:1", ms(t, 500)), GestureAction::Stop);
+        assert!(g.binding().is_none() && g.deadline().is_none());
+        assert_eq!(g.release("key:1", ms(t, 510)), GestureAction::Ignore);
+    }
+    #[test]
+    fn short_tap_without_second_press_is_discarded_after_window() {
+        let t = std::time::Instant::now();
+        let mut g = PressGesture::default();
+        g.press("mouse:X2", t);
+        assert_eq!(g.release("mouse:X2", ms(t, 499)), GestureAction::Ignore);
+        assert_eq!(g.deadline(), Some(ms(t, 999)));
+        assert_eq!(g.expire(ms(t, 998)), GestureAction::Ignore);
+        assert_eq!(g.expire(ms(t, 999)), GestureAction::DiscardTap);
+        assert!(g.binding().is_none());
+        assert_eq!(g.expire(ms(t, 2000)), GestureAction::Ignore);
+        assert_eq!(g.press("mouse:X2", ms(t, 2000)), GestureAction::Start);
+    }
+    #[test]
+    fn tap_then_press_locks_until_next_press_after_a_release() {
+        let t = std::time::Instant::now();
+        let mut g = PressGesture::default();
+        g.press("key:1", t);
+        g.release("key:1", ms(t, 100));
+        assert_eq!(g.press("key:1", ms(t, 300)), GestureAction::Lock);
+        assert!(g.deadline().is_none());
+        assert_eq!(g.press("key:1", ms(t, 350)), GestureAction::Ignore); // auto-repeat
+        assert_eq!(g.release("key:1", ms(t, 400)), GestureAction::Ignore);
+        assert_eq!(g.expire(ms(t, 60_000)), GestureAction::Ignore);
+        assert_eq!(g.release("key:1", ms(t, 60_000)), GestureAction::Ignore);
+        assert_eq!(g.press("key:1", ms(t, 60_000)), GestureAction::Stop);
+        assert_eq!(g.release("key:1", ms(t, 60_100)), GestureAction::Ignore);
+        assert!(g.binding().is_none());
+    }
+    #[test]
+    fn other_bindings_cannot_advance_a_gesture() {
+        let t = std::time::Instant::now();
+        let mut g = PressGesture::default();
+        g.press("key:1", t);
+        assert_eq!(g.press("mouse:X1", ms(t, 10)), GestureAction::Ignore);
+        assert_eq!(g.release("mouse:X1", ms(t, 20)), GestureAction::Ignore);
+        g.release("key:1", ms(t, 30));
+        assert_eq!(g.press("mouse:X1", ms(t, 40)), GestureAction::Ignore);
+        assert!(g.deadline().is_some());
+        g.reset();
+        assert_eq!(g.press("mouse:X1", ms(t, 50)), GestureAction::Start);
+    }
+    #[test]
+    fn gestures_drive_session_control_through_owner_scoped_commands() {
+        let t = std::time::Instant::now();
+        let mut g = PressGesture::default();
+        let mut c = SessionControl::default();
+        assert_eq!(g.press("key:1", t), GestureAction::Start);
+        c.press("key:1", "dictation", "locked");
+        g.release("key:1", ms(t, 100));
+        g.press("key:1", ms(t, 200));
+        g.release("key:1", ms(t, 300));
+        // Locked recording: the release was withheld, so the owner still stops it.
+        assert!(c.release("mouse:X1").is_none());
+        assert_eq!(g.press("key:1", ms(t, 5000)), GestureAction::Stop);
+        assert_eq!(c.release("key:1").unwrap().action, "stop");
+        assert!(c.release("key:1").is_none());
+        c.finish("locked");
+        g.press("key:1", ms(t, 6000));
+        c.press("key:1", "dictation", "tapped");
+        g.release("key:1", ms(t, 6100));
+        assert_eq!(g.expire(ms(t, 6600)), GestureAction::DiscardTap);
+        assert_eq!(c.cancel().unwrap().action, "cancel");
+        assert!(!c.may_commit("tapped"));
+    }
     #[test]
     fn stale_identity_and_status_cannot_commit() {
         let a = EngineIdentity {
@@ -392,6 +470,105 @@ impl SessionControl {
         }
         self.active = None;
         true
+    }
+}
+
+/// A release sooner than this after the press is a tap, not a dictation.
+pub(super) const TAP_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(500);
+/// After a tap, a second press within this window locks hands-free recording.
+pub(super) const LOCK_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum GestureAction {
+    Ignore,
+    Start,
+    Stop,
+    DiscardTap,
+    /// Recording continues hands-free; no session command is sent.
+    Lock,
+}
+
+#[derive(Clone, Copy, Default)]
+enum GesturePhase {
+    #[default]
+    Idle,
+    Held(std::time::Instant),
+    AwaitingLock(std::time::Instant),
+    /// `released` turns true on the first release after locking, so key
+    /// auto-repeat of the locking press cannot end the recording.
+    Locked { released: bool },
+}
+
+/// Turns one binding's presses and releases into session commands: hold to
+/// talk, a short tap is discarded, and tap then press locks hands-free. Only
+/// the binding that started the gesture can advance it.
+#[derive(Default)]
+pub(super) struct PressGesture {
+    binding: Option<String>,
+    phase: GesturePhase,
+}
+impl PressGesture {
+    pub fn binding(&self) -> Option<&str> {
+        self.binding.as_deref()
+    }
+    pub fn deadline(&self) -> Option<std::time::Instant> {
+        match self.phase {
+            GesturePhase::AwaitingLock(deadline) => Some(deadline),
+            _ => None,
+        }
+    }
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+    pub fn press(&mut self, binding: &str, now: std::time::Instant) -> GestureAction {
+        if matches!(self.phase, GesturePhase::Idle) {
+            self.binding = Some(binding.into());
+            self.phase = GesturePhase::Held(now);
+            return GestureAction::Start;
+        }
+        if self.binding.as_deref() != Some(binding) {
+            return GestureAction::Ignore;
+        }
+        match self.phase {
+            GesturePhase::AwaitingLock(_) => {
+                self.phase = GesturePhase::Locked { released: false };
+                GestureAction::Lock
+            }
+            GesturePhase::Locked { released: true } => {
+                self.reset();
+                GestureAction::Stop
+            }
+            _ => GestureAction::Ignore,
+        }
+    }
+    pub fn release(&mut self, binding: &str, now: std::time::Instant) -> GestureAction {
+        if self.binding.as_deref() != Some(binding) {
+            return GestureAction::Ignore;
+        }
+        match self.phase {
+            GesturePhase::Held(pressed) if now.saturating_duration_since(pressed) < TAP_THRESHOLD => {
+                self.phase = GesturePhase::AwaitingLock(now + LOCK_WINDOW);
+                GestureAction::Ignore
+            }
+            GesturePhase::Held(_) => {
+                self.reset();
+                GestureAction::Stop
+            }
+            GesturePhase::Locked { .. } => {
+                self.phase = GesturePhase::Locked { released: true };
+                GestureAction::Ignore
+            }
+            _ => GestureAction::Ignore,
+        }
+    }
+    pub fn expire(&mut self, now: std::time::Instant) -> GestureAction {
+        match self.phase {
+            GesturePhase::AwaitingLock(deadline) if now >= deadline => {
+                self.reset();
+                GestureAction::DiscardTap
+            }
+            _ => GestureAction::Ignore,
+        }
     }
 }
 

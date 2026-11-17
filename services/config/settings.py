@@ -42,6 +42,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "decode_timeout_seconds": 60,
         "idle_timeout_seconds": 60,
         "reap_timeout_seconds": 5,
+        "languages": [],
     },
     "local_editor": {
         "enabled": False,

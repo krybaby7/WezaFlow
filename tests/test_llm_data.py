@@ -75,6 +75,21 @@ class TextFormatterTests(unittest.TestCase):
 
         self.assertEqual(result.text, "Hello, team.\nAre we ready?\n\nThanks\nBye.")
 
+    def test_format_drops_terminal_comma_artifacts(self):
+        from services.llm.formatter import TextFormatter
+
+        formatter = TextFormatter(backend=None)
+
+        cases = {
+            "that sounds good comma": "That sounds good.",
+            "that sounds good,": "That sounds good.",
+            "that sounds good comma period": "That sounds good.",
+        }
+
+        for raw_text, expected_text in cases.items():
+            with self.subTest(raw_text=raw_text):
+                self.assertEqual(formatter.format(raw_text, app_context()).text, expected_text)
+
     def test_format_resolves_spoken_self_corrections(self):
         from services.llm.formatter import TextFormatter
 

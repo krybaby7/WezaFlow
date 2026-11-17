@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "recording-bar-capability",
+  "description": "Receive recording feedback in the floating recording bar",
+  "windows": ["recording-bar"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

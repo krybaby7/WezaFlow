@@ -78,6 +78,7 @@ export type Settings = {
     system_audio_duck_volume: number;
     use_ollama: boolean;
     experimental_automatic_paste?: boolean;
+    caret_shaping?: boolean;
   };
   [key: string]: unknown;
 };

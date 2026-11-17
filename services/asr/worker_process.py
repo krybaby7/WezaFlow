@@ -35,7 +35,9 @@ def worker_main(connection, config, identity, generation, runtime_hash):
         runtime_handles = configure_runtime(config.runtime_manifest, runtime_hash)
         import numpy as np
         from services.asr.transcriber import Transcriber, FasterWhisperBackend
-        transcriber = Transcriber(backend=FasterWhisperBackend(config.snapshot, device=config.device, compute_type=config.compute_type, cpu_threads=config.cpu_threads, local_files_only=True))
+        # Long dictations span several 30 s windows; do not let one window's
+        # error condition the next.
+        transcriber = Transcriber(backend=FasterWhisperBackend(config.snapshot, device=config.device, compute_type=config.compute_type, cpu_threads=config.cpu_threads, local_files_only=True, allowed_languages=config.languages, condition_on_previous_text=False))
         loading = time.perf_counter()
         _ = transcriber.backend.model
         warming = time.perf_counter()

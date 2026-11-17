@@ -252,16 +252,22 @@ class SerializedSessionController:
             with self._condition:
                 if self._cancelled: return
             recorder.start()
+            _warm_audio_fast_path()
             while True:
                 capture = self._read_capture(recorder, poll=True)
                 with self._condition:
                     if not self._cancelled:
                         self._capture = capture
                         self._state = 'draining' if self._stop else 'recording'
-                    if self._stop or self._cancelled or (capture and capture['terminal_code']):
+                    terminal = bool(capture and capture['terminal_code'])
+                    if self._stop or self._cancelled or terminal:
                         if not self._cancelled: self._state = 'draining'
+                        released = self._stop and not self._cancelled and not terminal
                         break
                     self._condition.wait(timeout=0.05)
+            tail_ms = settings.get('audio', {}).get('release_tail_ms', 0)
+            if released and tail_ms > 0:
+                self._wait_release_tail(tail_ms / 1000)
             stopped = True
             audio = recorder.stop()
             capture = self._read_capture(recorder)
@@ -306,6 +312,11 @@ class SerializedSessionController:
                 self._busy = False
                 self._condition.notify_all()
 
+    def _wait_release_tail(self, seconds):
+        # The recorder keeps capturing the end of the last word after key release.
+        with self._condition:
+            self._condition.wait_for(lambda: self._cancelled or self._closed, timeout=seconds)
+
     def wait_for_worker(self, timeout=None):
         """Bounded join for shutdown and deterministic adapter tests."""
         with self._condition:
@@ -349,6 +360,25 @@ class CaptureFailure(RuntimeError):
     pass
 
 
+_audio_warmup_started = False
+
+
+def _warm_audio_fast_path():
+    """Import numpy while the user speaks, so the first stop does not pay for it."""
+    global _audio_warmup_started
+    if _audio_warmup_started:
+        return
+    _audio_warmup_started = True
+
+    def warm():
+        try:
+            import numpy  # noqa: F401
+        except ImportError:
+            pass  # The audio modules fall back to pure Python.
+
+    Thread(target=warm, name='wezza-audio-warmup', daemon=True).start()
+
+
 
 def freeze_settings(value):
     if isinstance(value, dict):
@@ -369,6 +399,9 @@ def validate_session_settings(settings):
     audio = settings.get('audio', {})
     if type(audio.get('sample_rate', 16000)) is not int or type(audio.get('channels', 1)) is not int or audio.get('sample_rate', 16000) != 16000 or audio.get('channels', 1) != 1:
         raise ValueError('Only mono 16 kHz capture is supported')
+    tail = audio.get('release_tail_ms', 0)
+    if isinstance(tail, bool) or not isinstance(tail, (int, float)) or not math.isfinite(tail) or not 0 <= tail <= 500:
+        raise ValueError('audio.release_tail_ms must be between 0 and 500')
     for section, keys in {'audio': ('blocksize',), 'vad': ('threshold', 'min_speech_duration_ms', 'trim_threshold', 'quiet_threshold', 'quiet_trim_threshold'), 'models': ('whisper_cpu_threads', 'whisper_speculative_cpu_threads')}.items():
         for key in keys:
             value = settings.get(section, {}).get(key)

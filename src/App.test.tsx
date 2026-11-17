@@ -9,14 +9,16 @@ const tauriMocks = vi.hoisted(() => ({
   bringLocalFlowWindowForward: vi.fn(async () => undefined),
   configureDesktopSettings: vi.fn(async () => undefined),
   getDesktopWindowLabel: vi.fn(() => "main"),
-  listenToRecordingBarState: vi.fn(async (_callback?: unknown) => () => undefined)
+  listenToRecordingBarState: vi.fn(async (_callback?: unknown) => () => undefined),
+  startDesktopRuntime: vi.fn(async () => undefined)
 }));
 
 vi.mock("./lib/tauri", () => ({
   bringLocalFlowWindowForward: tauriMocks.bringLocalFlowWindowForward,
   configureDesktopSettings: tauriMocks.configureDesktopSettings,
   getDesktopWindowLabel: tauriMocks.getDesktopWindowLabel,
-  listenToRecordingBarState: tauriMocks.listenToRecordingBarState
+  listenToRecordingBarState: tauriMocks.listenToRecordingBarState,
+  startDesktopRuntime: tauriMocks.startDesktopRuntime
 }));
 
 function fakeClient(overrides: Partial<RuntimeClient> = {}): RuntimeClient {
@@ -82,6 +84,59 @@ describe("App", () => {
     expect(screen.queryByRole("tablist", { name: "Settings sections" })).not.toBeInTheDocument();
   });
 
+  it("lets the recording bar receive native state events", () => {
+    const capabilities = import.meta.glob<{ windows?: string[]; permissions?: string[] }>(
+      "../src-tauri/capabilities/*.json",
+      { eager: true, import: "default" }
+    );
+    const permissions = Object.values(capabilities)
+      .filter((capability) => capability.windows?.includes("recording-bar"))
+      .flatMap((capability) => capability.permissions ?? []);
+
+    expect(permissions.sort()).toEqual([
+      "core:event:allow-listen",
+      "core:event:allow-unlisten"
+    ]);
+  });
+
+  it("shows idle feedback without a recording indicator or animation", async () => {
+    const fs = await vi.importActual<{ readFileSync(path: string, encoding: "utf8"): string }>("node:fs");
+    const style = document.createElement("style");
+    style.textContent = fs.readFileSync("src/styles.css", "utf8");
+    document.head.append(style);
+    try {
+      tauriMocks.getDesktopWindowLabel.mockReturnValue("recording-bar");
+      render(<App client={fakeClient()} />);
+      const waveform = screen.getByRole("status", { name: "Recording feedback" })
+        .querySelector(".recording-waveform span")!;
+
+      expect(screen.queryByText("ON")).not.toBeInTheDocument();
+      expect(getComputedStyle(waveform).animation).toBe("none");
+
+      const handler = tauriMocks.listenToRecordingBarState.mock.calls[0][0] as unknown as
+        (payload: { state: string; mode: string }) => void;
+      await act(async () => handler({ state: "recording", mode: "dictation" }));
+      expect(screen.getByText("ON")).toBeInTheDocument();
+      expect(getComputedStyle(waveform).animation).toContain("waveform-rise");
+
+      await act(async () => handler({ state: "ready", mode: "dictation" }));
+      expect(screen.queryByText("ON")).not.toBeInTheDocument();
+      expect(getComputedStyle(waveform).animation).toBe("none");
+    } finally {
+      style.remove();
+    }
+  });
+
+  it("reports when recording feedback cannot subscribe to native events", async () => {
+    tauriMocks.getDesktopWindowLabel.mockReturnValue("recording-bar");
+    tauriMocks.listenToRecordingBarState.mockRejectedValueOnce(new Error("Event permission denied"));
+
+    render(<App client={fakeClient()} />);
+
+    expect(await screen.findByText("Recording status unavailable.")).toBeInTheDocument();
+    expect(screen.queryByText("ON")).not.toBeInTheDocument();
+  });
+
   it("renders the normal settings shell in the main window", async () => {
     render(<App client={fakeClient()} />);
 
@@ -128,6 +183,24 @@ describe("App", () => {
     expect(warmRuntime).not.toHaveBeenCalled();
   });
 
+  it("waits for the engine before loading settings on startup", async () => {
+    let markReady!: () => void;
+    const ready = new Promise<undefined>((resolve) => {
+      markReady = () => resolve(undefined);
+    });
+    tauriMocks.startDesktopRuntime.mockReturnValueOnce(ready);
+    const client = fakeClient();
+
+    render(<App client={client} />);
+    expect(screen.getByRole("button", { name: "Refresh" })).toBeDisabled();
+    expect(client.getSettings).not.toHaveBeenCalled();
+
+    await act(async () => markReady());
+    expect(await screen.findByText("Runtime API connected")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+    expect(tauriMocks.configureDesktopSettings).toHaveBeenCalledOnce();
+  });
+
   it("shows the capture limit warning on the originating result", async () => {
     const client = fakeClient({getStatus: vi.fn(async () => ({status:"ok",state:"ready",mode:"dictation",profile:"low-impact",quiet_mode:false,quality_fallback:false,last_error:null,session_id:"one",result_session_id:"one",result:{raw_transcript:"hello",polished_text:"Hello.",diagnostics:{capture:{terminal_code:"duration_limit"}}}}))});
     render(<App client={client} />);
@@ -158,6 +231,30 @@ describe("App", () => {
     expect(writeText).not.toHaveBeenCalled();
     await userEvent.click(screen.getByRole("button", {name:"Copy result"}));
     expect(writeText).toHaveBeenCalledWith("Hello.");
+  });
+
+  it("ends a sent paste quietly and points an undelivered result to Ctrl+V", async () => {
+    tauriMocks.getDesktopWindowLabel.mockReturnValue("recording-bar");
+    render(<App client={fakeClient()} />);
+    const handler = tauriMocks.listenToRecordingBarState.mock.calls[0]?.[0] as unknown as (value: {state:string;mode:string;message?:string|null;delivery?:string|null}) => void;
+    await act(async () => handler({state:"ready",mode:"dictation",message:null,delivery:"pasted"}));
+    expect(screen.getByText("Pasted")).toBeInTheDocument();
+    expect(screen.queryByText("Ready to copy")).not.toBeInTheDocument();
+    expect(screen.getByRole("status",{name:"Recording feedback"}).querySelector("small")).toBeNull();
+    await act(async () => handler({state:"ready",mode:"dictation",message:"Press Ctrl+V to paste it.",delivery:"clipboard"}));
+    expect(screen.getByText("Copied to clipboard")).toBeInTheDocument();
+    expect(screen.getByText("Press Ctrl+V to paste it.")).toBeInTheDocument();
+    await act(async () => handler({state:"recording",mode:"dictation",delivery:"pasted"}));
+    expect(screen.getByText("Listening")).toBeInTheDocument();
+    await act(async () => handler({state:"cancelled",mode:"dictation",message:"Hold the key to dictate."}));
+    expect(screen.getByText("Hold the key to dictate.")).toBeInTheDocument();
+  });
+
+  it("describes clipboard restore and fallback for automatic paste", async () => {
+    render(<App client={fakeClient()} />);
+    await userEvent.click(await screen.findByRole("tab", { name: "Dictation" }));
+    expect(await screen.findByText(/puts back what was on your clipboard/)).toBeInTheDocument();
+    expect(screen.queryByText(/leaves the result on your clipboard/)).not.toBeInTheDocument();
   });
 
   it("renders acknowledged processing, recovery and cancellation states after release", async () => {
@@ -223,6 +320,25 @@ describe("App", () => {
 
     await waitFor(() => expect(saveSettings).toHaveBeenCalled());
     expect(saveSettings.mock.calls[0][0].hotkeys.dictation).toEqual(["MouseX1"]);
+  });
+
+  it("offers caret shaping alongside automatic paste and saves it", async () => {
+    const saveSettings = vi.fn(async (settings) => settings);
+    render(<App client={fakeClient({ saveSettings })} />);
+
+    await userEvent.click(await screen.findByRole("tab", { name: "Dictation" }));
+    const shaping = await screen.findByLabelText("Fit dictation to surrounding text");
+    expect(shaping).toBeChecked();
+    expect(shaping).toBeDisabled();
+    await userEvent.click(screen.getByLabelText("Enable experimental automatic paste"));
+    expect(shaping).toBeEnabled();
+    await userEvent.click(shaping);
+    expect(shaping).not.toBeChecked();
+    await userEvent.click(screen.getByRole("button", { name: "Save settings" }));
+
+    await waitFor(() => expect(saveSettings).toHaveBeenCalled());
+    expect(saveSettings.mock.calls[0][0].runtime.experimental_automatic_paste).toBe(true);
+    expect(saveSettings.mock.calls[0][0].runtime.caret_shaping).toBe(false);
   });
 
   it("saves audio ducking settings from the dictation tab", async () => {

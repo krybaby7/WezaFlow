@@ -85,6 +85,28 @@ class LocalEditorOwner:
             self._reason = 'experimental_unqualified'
             return LocalCleanupFormatter(editor=ConstrainedEditor(self._service.backend(config)))
 
+    def warm(self, settings):
+        """Start the configured editor ahead of its first edit; never raises."""
+        try:
+            validate_editor_settings(settings)
+            if not editor_values(settings)['enabled']:
+                return False
+            config = editor_config(settings)
+        except (ValueError, TypeError, OSError):
+            return False
+        with self._lock:
+            if self._closed:
+                return False
+            service = self._service
+        # A closed service is only replaced by formatter(), which owns that decision.
+        warm = getattr(service, 'warm', None)
+        try:
+            if not callable(warm) or service.snapshot()['closed']:
+                return False
+            return warm(config) is True
+        except Exception:
+            return False
+
     def snapshot(self):
         with self._lock:
             service, reason = self._service, self._reason

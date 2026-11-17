@@ -26,8 +26,9 @@ const RECORDING_BAR_HEIGHT: i32 = 72;
 const RECORDING_BAR_BOTTOM_MARGIN: i32 = 72;
 use session::{
     owned_request, protected_path, validate_handshake, validate_reply, DispatchDecision,
-    EngineIdentity, SessionCommand, SessionControl,
+    EngineIdentity, GestureAction, PressGesture, SessionCommand, SessionControl,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(windows))]
 use std::io::Read;
 
@@ -61,6 +62,101 @@ static START_MOUSE_HOOK: Once = Once::new();
 #[cfg(windows)]
 static MOUSE_HOOK_APP: OnceLock<AppHandle> = OnceLock::new();
 
+/// Physical input observed by the OS hooks. The hooks only post these; one
+/// worker thread turns them into session commands.
+enum InputEvent {
+    Shortcut { shortcut: Shortcut, pressed: bool },
+    Mouse { button: MouseButtonBinding, pressed: bool },
+}
+
+static INPUT_EVENTS: std::sync::OnceLock<mpsc::Sender<InputEvent>> = std::sync::OnceLock::new();
+
+// Read by the low-level mouse hook, which must not take locks. Published
+// whenever the registered hotkeys change, including when they are cleared.
+static MOUSE_X1_BOUND: AtomicBool = AtomicBool::new(false);
+static MOUSE_X2_BOUND: AtomicBool = AtomicBool::new(false);
+
+fn bound_mouse_buttons(hotkeys: &RegisteredHotkeys) -> (bool, bool) {
+    let bound = |button| {
+        hotkeys.dictation.mouse.contains(&button) || hotkeys.command_mode.mouse.contains(&button)
+    };
+    (bound(MouseButtonBinding::X1), bound(MouseButtonBinding::X2))
+}
+
+fn publish_mouse_bindings(hotkeys: &RegisteredHotkeys) {
+    let (x1, x2) = bound_mouse_buttons(hotkeys);
+    MOUSE_X1_BOUND.store(x1, Ordering::Relaxed);
+    MOUSE_X2_BOUND.store(x2, Ordering::Relaxed);
+}
+
+fn post_input_event(event: InputEvent) {
+    if let Some(sender) = INPUT_EVENTS.get() {
+        let _ = sender.send(event);
+    }
+}
+
+/// Keeps the Python engine tree inside a kill-on-close job, so an engine can
+/// never outlive this shell (crash, hang or forced close) and block port 8765.
+#[cfg(windows)]
+struct RuntimeJob(windows_sys::Win32::Foundation::HANDLE);
+#[cfg(windows)]
+unsafe impl Send for RuntimeJob {}
+#[cfg(windows)]
+unsafe impl Sync for RuntimeJob {}
+
+#[cfg(windows)]
+static RUNTIME_JOB: OnceLock<Option<RuntimeJob>> = OnceLock::new();
+
+#[cfg(windows)]
+fn contain_runtime_child(child: &Child) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{Foundation::CloseHandle, System::JobObjects::*};
+    let job = RUNTIME_JOB.get_or_init(|| unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return None;
+        }
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &limits as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) == 0
+        {
+            CloseHandle(job);
+            return None;
+        }
+        // Never closed explicitly: the OS closes it when this process ends.
+        Some(RuntimeJob(job))
+    });
+    match job {
+        Some(job) => unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle() as _) != 0 },
+        None => false,
+    }
+}
+
+#[cfg(not(windows))]
+fn contain_runtime_child(_child: &Child) -> bool {
+    false
+}
+
+/// Runs a task on the UI thread and waits for it. Callers must not hold a lock
+/// the UI thread can wait on; the UI thread itself never takes shell locks.
+fn on_main_thread<T: Send + 'static>(
+    app: &AppHandle,
+    task: impl FnOnce(&AppHandle) -> T + Send + 'static,
+) -> Result<T, String> {
+    let (sender, receiver) = mpsc::channel();
+    let handle = app.clone();
+    app.run_on_main_thread(move || {
+        let _ = sender.send(task(&handle));
+    })
+    .map_err(|err| err.to_string())?;
+    receiver.recv().map_err(|err| err.to_string())
+}
+
 #[derive(Default)]
 struct DesktopState {
     runtime_process: Mutex<Option<Child>>,
@@ -69,6 +165,9 @@ struct DesktopState {
     audio_ducking: Mutex<AudioDuckingState>,
     audio_ducking_settings: Mutex<AudioDuckingSettings>,
     commands: Mutex<ShellCommands>,
+    recording_bar: Mutex<RecordingBarLifetime>,
+    /// Never locked while waiting for a read; see `CaretReads::collect`.
+    caret: caret::CaretReads,
 }
 
 #[derive(Default)]
@@ -77,6 +176,12 @@ struct ShellCommands {
     sender: Option<mpsc::Sender<(SessionCommand, EngineIdentity)>>,
     experimental_paste: bool,
     paste_target: Option<windows_paste::Target>,
+    /// Session cancelled because its binding was only tapped, with the hint
+    /// shown when the cancellation is acknowledged.
+    discarded_tap: Option<(String, &'static str)>,
+    /// Session locked into hands-free recording.
+    hands_free: Option<String>,
+    caret_shaping: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -110,6 +215,61 @@ struct RecordingBarStatePayload {
     state: String,
     mode: String,
     message: Option<String>,
+    /// "pasted" or "clipboard" once automatic paste settled a ready result.
+    delivery: Option<String>,
+}
+
+#[derive(Default)]
+struct RecordingBarLifetime {
+    revision: u64,
+    terminal: bool,
+    state: String,
+    dismissed: bool,
+}
+
+impl RecordingBarLifetime {
+    fn update(&mut self, state: &str) -> Option<u64> {
+        if self.state == state && self.terminal {
+            return None;
+        }
+        self.revision += 1;
+        self.state = state.into();
+        self.dismissed = false;
+        self.terminal = matches!(state, "ready" | "no_speech" | "cancelled" | "error");
+        self.terminal.then_some(self.revision)
+    }
+
+    fn may_hide(&self, revision: u64) -> bool {
+        self.terminal && !self.dismissed && self.revision == revision
+    }
+
+    fn dismiss(&mut self, revision: u64) -> bool {
+        if !self.may_hide(revision) {
+            return false;
+        }
+        self.dismissed = true;
+        true
+    }
+
+    fn invalidate(&mut self) {
+        self.revision += 1;
+        self.terminal = false;
+        self.state.clear();
+        self.dismissed = true;
+    }
+}
+
+/// What automatic paste tells the recording bar about a ready result.
+#[derive(Debug, Default, PartialEq)]
+struct PasteFeedback {
+    delivery: Option<&'static str>,
+    message: Option<String>,
+}
+
+impl PasteFeedback {
+    fn message(message: impl Into<String>) -> Self {
+        Self { delivery: None, message: Some(message.into()) }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
@@ -159,6 +319,7 @@ struct DesktopRuntimeSettings {
     system_audio_ducking: Option<bool>,
     system_audio_duck_volume: Option<u8>,
     experimental_automatic_paste: Option<bool>,
+    caret_shaping: Option<bool>,
 }
 
 trait VolumeEndpoint {
@@ -215,12 +376,14 @@ fn show_settings_window(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
+// Both commands take shell locks, so they run off the UI thread: session
+// workers hold those locks while waiting for UI-thread window work.
+#[tauri::command(async)]
 fn register_hotkeys(app: AppHandle, hotkeys: HotkeySettings) -> Result<(), String> {
     register_hotkeys_inner(&app, hotkeys)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn configure_desktop_settings(app: AppHandle, settings: DesktopSettings) -> Result<(), String> {
     configure_desktop_settings_inner(&app, settings)
 }
@@ -237,6 +400,7 @@ pub fn run() {
         .setup(|app| {
             create_tray(app)?;
             start_command_dispatcher(app.handle().clone());
+            start_input_worker(app.handle().clone());
             let handle = app.handle().clone();
             thread::spawn(move || {
                 if let Err(err) = spawn_runtime_api(&handle) {
@@ -264,6 +428,13 @@ pub fn run() {
         .expect("error while building WezaFlow")
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
+                // A session worker may be waiting for this thread while holding a
+                // lock shutdown needs. Never let that keep a dead window alive: the
+                // engine job is reaped by the OS when the process ends.
+                thread::spawn(|| {
+                    thread::sleep(Duration::from_secs(8));
+                    std::process::exit(0);
+                });
                 let _ = shutdown_runtime(app);
             }
         });
@@ -339,12 +510,14 @@ fn apply_hotkeys(app: &AppHandle, hotkeys: HotkeySettings, active: bool) -> Resu
     let registered = parse_registered_hotkeys(hotkeys)?;
     let state = app.state::<DesktopState>();
     let mut current = state.hotkeys.lock().map_err(|e| e.to_string())?;
-    replace_hotkeys(
+    let result = replace_hotkeys(
         &mut *current,
         registered,
         active,
         &mut DesktopHotkeyRegistrar(app),
-    )
+    );
+    publish_mouse_bindings(&current);
+    result
 }
 
 trait HotkeyRegistrar {
@@ -355,17 +528,22 @@ trait HotkeyRegistrar {
 struct DesktopHotkeyRegistrar<'a>(&'a AppHandle);
 
 impl HotkeyRegistrar for DesktopHotkeyRegistrar<'_> {
+    // The plugin's bulk unregister holds its shortcut table while it waits for
+    // the UI thread, and the UI thread needs that table to deliver a key press.
+    // Running the whole call on the UI thread removes that wait.
     fn unregister_all(&mut self) -> Result<(), String> {
-        self.0
-            .global_shortcut()
-            .unregister_all()
-            .map_err(|e| e.to_string())
+        on_main_thread(self.0, |app| {
+            app.global_shortcut()
+                .unregister_all()
+                .map_err(|e| e.to_string())
+        })?
     }
     fn register(&mut self, shortcut: Shortcut) -> Result<(), String> {
-        self.0
-            .global_shortcut()
-            .register(shortcut)
-            .map_err(|e| e.to_string())
+        on_main_thread(self.0, move |app| {
+            app.global_shortcut()
+                .register(shortcut)
+                .map_err(|e| e.to_string())
+        })?
     }
 }
 
@@ -410,6 +588,8 @@ fn configure_desktop_settings_inner(
     let mut commands = state.commands.lock().map_err(|e| e.to_string())?;
     let experimental_paste = settings.runtime.as_ref()
         .and_then(|r| r.experimental_automatic_paste).unwrap_or(false);
+    let caret_shaping = settings.runtime.as_ref()
+        .and_then(|r| r.caret_shaping).unwrap_or(true);
     let requested = settings
         .runtime
         .map(AudioDuckingSettings::from_runtime_settings)
@@ -428,17 +608,142 @@ fn configure_desktop_settings_inner(
     apply_hotkeys(app, settings.hotkeys, active)?;
     *audio_settings = requested;
     commands.experimental_paste = experimental_paste;
+    commands.caret_shaping = caret_shaping;
     Ok(())
 }
 
 fn handle_shortcut(
-    app: &AppHandle,
+    _app: &AppHandle,
     shortcut: &Shortcut,
     event: tauri_plugin_global_shortcut::ShortcutEvent,
 ) {
+    // The plugin calls this while holding its shortcut table, and for a press
+    // on the UI thread. Registering Escape from here re-locks that table and
+    // freezes the app, so only hand the event to the input worker.
+    post_input_event(InputEvent::Shortcut {
+        shortcut: shortcut.clone(),
+        pressed: event.state() == ShortcutState::Pressed,
+    });
+}
+
+fn start_input_worker(app: AppHandle) {
+    let (sender, receiver) = mpsc::channel::<InputEvent>();
+    if INPUT_EVENTS.set(sender).is_err() {
+        return;
+    }
+    thread::spawn(move || {
+        let mut input = InputGesture::default();
+        loop {
+            // The only timed wait: a tap's window for the hands-free second press.
+            let event = match input.gesture.deadline() {
+                Some(deadline) => {
+                    match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                        Ok(event) => Some(event),
+                        Err(mpsc::RecvTimeoutError::Timeout) => None,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                None => match receiver.recv() {
+                    Ok(event) => Some(event),
+                    Err(_) => break,
+                },
+            };
+            let binding = input.gesture.binding().map(str::to_string);
+            let expired = input.gesture.expire(Instant::now());
+            input.act(&app, expired, binding.as_deref().unwrap_or(""), "");
+            match event {
+                Some(InputEvent::Shortcut { shortcut, pressed }) => {
+                    process_shortcut(&app, &mut input, &shortcut, pressed)
+                }
+                Some(InputEvent::Mouse { button, pressed }) => {
+                    handle_mouse_button(&app, &mut input, button, pressed)
+                }
+                None => {}
+            }
+        }
+    });
+}
+
+/// Hold-to-talk, tap discard and hands-free lock for the input worker.
+#[derive(Default)]
+struct InputGesture {
+    gesture: PressGesture,
+    session: Option<String>,
+}
+
+impl InputGesture {
+    fn binding_input(&mut self, app: &AppHandle, binding: &str, mode: &str, pressed: bool) {
+        // A session the engine ended on its own (limit, error) leaves no gesture.
+        if self.gesture.binding().is_some()
+            && !self.session.as_deref().is_some_and(|id| session_is_active(app, id))
+        {
+            self.gesture.reset();
+        }
+        let now = Instant::now();
+        let action = if pressed {
+            self.gesture.press(binding, now)
+        } else {
+            self.gesture.release(binding, now)
+        };
+        self.act(app, action, binding, mode);
+    }
+
+    fn act(&mut self, app: &AppHandle, action: GestureAction, binding: &str, mode: &str) {
+        match action {
+            GestureAction::Ignore => {}
+            GestureAction::Start => {
+                self.session =
+                    enqueue_session_command(app, SessionRequest::Start { binding, mode });
+                if self.session.is_none() {
+                    self.gesture.reset();
+                }
+            }
+            GestureAction::Stop => {
+                enqueue_session_command(app, SessionRequest::Stop { binding });
+                self.session = None;
+            }
+            GestureAction::Lock => {
+                // Shown by the dispatcher's next recording status.
+                if let (Some(id), Ok(mut commands)) =
+                    (self.session.as_ref(), app.state::<DesktopState>().commands.lock())
+                {
+                    commands.hands_free = Some(id.clone());
+                }
+            }
+            GestureAction::DiscardTap => {
+                if let Some(session_id) = self.session.take() {
+                    let hint = if binding.starts_with("mouse:") {
+                        "Hold the button to dictate."
+                    } else {
+                        "Hold the key to dictate."
+                    };
+                    enqueue_session_command(
+                        app,
+                        SessionRequest::DiscardTap { session_id: &session_id, hint },
+                    );
+                }
+            }
+        }
+    }
+
+    fn cancel(&mut self, app: &AppHandle) {
+        self.gesture.reset();
+        self.session = None;
+        enqueue_session_command(app, SessionRequest::Cancel);
+    }
+}
+
+fn session_is_active(app: &AppHandle, id: &str) -> bool {
+    app.state::<DesktopState>()
+        .commands
+        .lock()
+        .is_ok_and(|commands| commands.control.active.as_ref().is_some_and(|c| c.session_id == id))
+}
+
+fn process_shortcut(app: &AppHandle, input: &mut InputGesture, shortcut: &Shortcut, pressed: bool) {
     if *shortcut == Shortcut::new(None, Code::Escape) {
-        if event.state() == ShortcutState::Pressed {
-            enqueue_session_command(app, "", "", "cancel");
+        if pressed {
+            input.cancel(app);
         }
         return;
     }
@@ -468,14 +773,7 @@ fn handle_shortcut(
     let Some(mode) = mode else {
         return;
     };
-    match event.state() {
-        ShortcutState::Pressed => {
-            enqueue_session_command(app, &format!("keyboard:{}", shortcut.id()), mode, "start")
-        }
-        ShortcutState::Released => {
-            enqueue_session_command(app, &format!("keyboard:{}", shortcut.id()), mode, "stop")
-        }
-    }
+    input.binding_input(app, &format!("keyboard:{}", shortcut.id()), mode, pressed);
 }
 
 fn parse_registered_hotkeys(hotkeys: HotkeySettings) -> Result<RegisteredHotkeys, String> {
@@ -848,11 +1146,13 @@ fn recording_bar_payload(
     state: &str,
     mode: &str,
     message: Option<&str>,
+    delivery: Option<&str>,
 ) -> RecordingBarStatePayload {
     RecordingBarStatePayload {
         state: state.to_string(),
         mode: mode.to_string(),
         message: message.map(|value| value.to_string()),
+        delivery: delivery.map(|value| value.to_string()),
     }
 }
 
@@ -878,26 +1178,104 @@ fn position_recording_bar(window: &WebviewWindow) {
 }
 
 fn show_recording_bar(app: &AppHandle, state: &str, mode: &str, message: Option<&str>) {
+    show_recording_bar_with_delivery(app, state, mode, message, None);
+}
+
+#[cfg(windows)]
+unsafe fn set_feedback_window_visible(window: windows_sys::Win32::Foundation::HWND, visible: bool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNA, SW_HIDE};
+    ShowWindow(window, if visible { SW_SHOWNA } else { SW_HIDE });
+}
+
+fn set_recording_bar_visible(window: &WebviewWindow, visible: bool) -> tauri::Result<()> {
+    #[cfg(windows)]
+    {
+        let target = window.clone();
+        window.run_on_main_thread(move || {
+            if visible && target.app_handle().state::<DesktopState>().recording_bar.lock()
+                .map(|lifetime| lifetime.dismissed).unwrap_or(true) {
+                return;
+            }
+            if let Ok(handle) = target.hwnd() {
+                unsafe {
+                    set_feedback_window_visible(handle.0 as _, visible);
+                }
+            }
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        if visible { window.show() } else { window.hide() }
+    }
+}
+
+fn show_recording_bar_with_delivery(
+    app: &AppHandle,
+    state: &str,
+    mode: &str,
+    message: Option<&str>,
+    delivery: Option<&str>,
+) {
     let Some(window) = recording_bar_window(app) else {
         return;
+    };
+    let revision = match app.state::<DesktopState>().recording_bar.lock() {
+        Ok(mut lifetime) => {
+            let revision = lifetime.update(state);
+            if lifetime.dismissed {
+                return;
+            }
+            revision
+        }
+        Err(_) => None,
     };
     position_recording_bar(&window);
     if let Err(err) = window.emit(
         RECORDING_BAR_EVENT,
-        recording_bar_payload(state, mode, message),
+        recording_bar_payload(state, mode, message, delivery),
     ) {
         eprintln!("WezaFlow could not emit recording bar state: {err}");
     }
-    if let Err(err) = window.show() {
+    if let Err(err) = set_recording_bar_visible(&window, true) {
         eprintln!("WezaFlow could not show recording bar: {err}");
+    }
+    if let Some(revision) = revision {
+        let delay = if message.is_some() || state == "error" {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_millis(1500)
+        };
+        let handle = app.clone();
+        thread::spawn(move || {
+            thread::sleep(delay);
+            let ui_handle = handle.clone();
+            let _ = handle.run_on_main_thread(move || {
+                let state = ui_handle.state::<DesktopState>();
+                if let Ok(mut lifetime) = state.recording_bar.lock() {
+                    if lifetime.dismiss(revision) {
+                        if let Some(window) = recording_bar_window(&ui_handle) {
+                            #[cfg(windows)]
+                            if let Ok(handle) = window.hwnd() {
+                                unsafe { set_feedback_window_visible(handle.0 as _, false); }
+                            }
+                            #[cfg(not(windows))]
+                            let _ = window.hide();
+                        }
+                    }
+                };
+            });
+        });
     }
 }
 
 fn hide_recording_bar(app: &AppHandle) {
+    if let Ok(mut lifetime) = app.state::<DesktopState>().recording_bar.lock() {
+        lifetime.invalidate();
+    }
     let Some(window) = recording_bar_window(app) else {
         return;
     };
-    if let Err(err) = window.hide() {
+    if let Err(err) = set_recording_bar_visible(&window, false) {
         eprintln!("WezaFlow could not hide recording bar: {err}");
     }
 }
@@ -911,66 +1289,96 @@ fn current_identity(app: &AppHandle) -> Result<EngineIdentity, String> {
         .ok_or_else(|| "Engine is not ready.".into())
 }
 
-fn enqueue_session_command(app: &AppHandle, binding: &str, mode: &str, action: &str) {
+enum SessionRequest<'a> {
+    Start { binding: &'a str, mode: &'a str },
+    Stop { binding: &'a str },
+    Cancel,
+    /// Cancels only `session_id`, never a later or unrelated session.
+    DiscardTap { session_id: &'a str, hint: &'static str },
+}
+
+/// Returns the session id of a command handed to the dispatcher.
+fn enqueue_session_command(app: &AppHandle, request: SessionRequest) -> Option<String> {
     let state = app.state::<DesktopState>();
-    let Ok(current) = state.engine_identity.lock() else {
-        return;
-    };
-    let Some(identity) = current.as_ref().cloned() else {
-        return;
-    };
-    let Ok(mut commands) = state.commands.lock() else {
-        return;
-    };
-    let command = match action {
-        "start" => {
-            let Ok(id) = new_uuid() else {
-                return;
-            };
+    let current = state.engine_identity.lock().ok()?;
+    let identity = current.as_ref().cloned()?;
+    let mut commands = state.commands.lock().ok()?;
+    let command = match request {
+        SessionRequest::Start { binding, mode } => {
+            let id = new_uuid().ok()?;
             let command = commands.control.press(binding, mode, &id);
             if command.is_some() {
+                if let Ok(mut lifetime) = state.recording_bar.lock() {
+                    lifetime.invalidate();
+                }
+                commands.discarded_tap = None;
+                commands.hands_free = None;
                 commands.paste_target = if commands.experimental_paste && mode == "dictation" {
                     new_uuid().ok().and_then(|capture| windows_paste::capture(&id, &capture))
                 } else { None };
             }
             command
         }
-        "stop" => commands.control.release(binding),
-        "cancel" => commands.control.cancel(),
-        _ => None,
-    };
-    if let Some(command) = command {
-        if command.action == "start" {
-            let escape = Shortcut::new(None, Code::Escape);
-            if let Err(err) = app.global_shortcut().register(escape) {
-                commands.control.finish(&command.session_id);
-                show_recording_bar(
-                    app,
-                    "error",
-                    mode,
-                    Some(&format!("Cannot register cancellation key: {err}")),
-                );
-                return;
+        SessionRequest::Stop { binding } => {
+            let command = commands.control.release(binding);
+            // Read the caret while the engine transcribes; collected at paste time.
+            let target = command.as_ref().and_then(|command| {
+                commands.paste_target.as_ref().filter(|target| {
+                    commands.experimental_paste
+                        && commands.caret_shaping
+                        && target.session_id == command.session_id
+                })
+            });
+            if let Some(target) = target {
+                state.caret.start(&target.session_id, target.process_id());
             }
+            command
         }
-        if commands
-            .sender
-            .as_ref()
-            .map(|s| s.send((command.clone(), identity)).is_ok())
-            != Some(true)
-        {
+        SessionRequest::Cancel => commands.control.cancel(),
+        SessionRequest::DiscardTap { session_id, hint } => {
+            if !commands.control.active.as_ref().is_some_and(|c| c.session_id == session_id) {
+                return None;
+            }
+            let command = commands.control.cancel();
+            if command.is_some() {
+                commands.discarded_tap = Some((session_id.to_string(), hint));
+            }
+            command
+        }
+    };
+    let command = command?;
+    if command.action == "start" {
+        let escape = Shortcut::new(None, Code::Escape);
+        if let Err(err) = app.global_shortcut().register(escape) {
             commands.control.finish(&command.session_id);
-            let _ = app
-                .global_shortcut()
-                .unregister(Shortcut::new(None, Code::Escape));
             show_recording_bar(
                 app,
                 "error",
                 &command.mode,
-                Some("Engine command dispatcher unavailable."),
+                Some(&format!("Cannot register cancellation key: {err}")),
             );
+            return None;
         }
     }
+    if commands
+        .sender
+        .as_ref()
+        .map(|s| s.send((command.clone(), identity)).is_ok())
+        != Some(true)
+    {
+        commands.control.finish(&command.session_id);
+        let _ = app
+            .global_shortcut()
+            .unregister(Shortcut::new(None, Code::Escape));
+        show_recording_bar(
+            app,
+            "error",
+            &command.mode,
+            Some("Engine command dispatcher unavailable."),
+        );
+        return None;
+    }
+    Some(command.session_id)
 }
 
 fn start_command_dispatcher(app: AppHandle) {
@@ -1109,7 +1517,7 @@ fn settle_runtime_reply(
 ) -> Option<DispatchDecision> {
     // This is the existing serialized dispatcher, not an additional writer worker.
     // Consume the captured target once before observing READY releases ownership.
-    let paste_message = maybe_compatibility_paste(app, id, identity, reply);
+    let paste = maybe_compatibility_paste(app, id, identity, reply).unwrap_or_default();
     let state = app.state::<DesktopState>();
     let current = state.engine_identity.lock().ok()?;
     if validate_reply(identity, current.as_ref(), reply).is_err() {
@@ -1133,11 +1541,24 @@ fn settle_runtime_reply(
         } else if ack.state != "starting" {
             restore_system_audio(app);
         }
-        show_recording_bar(
+        let tap_hint = match &commands.discarded_tap {
+            Some((session, hint)) if session == id && ack.state == "cancelled" => Some(*hint),
+            _ => None,
+        };
+        let hands_free = (ack.state == "recording"
+            && commands.hands_free.as_deref() == Some(id))
+        .then_some("Hands-free. Press again to finish.");
+        show_recording_bar_with_delivery(
             app,
             &ack.state,
             &ack.mode,
-            paste_message.as_deref().or_else(|| session::runtime_message(id, reply)),
+            paste
+                .message
+                .as_deref()
+                .or(tap_hint)
+                .or_else(|| session::runtime_message(id, reply))
+                .or(hands_free),
+            paste.delivery,
         );
         if matches!(
             ack.state.as_str(),
@@ -1166,7 +1587,7 @@ fn settle_runtime_reply(
 
 fn maybe_compatibility_paste(
     app: &AppHandle, id: &str, identity: &EngineIdentity, reply: &serde_json::Value,
-) -> Option<String> {
+) -> Option<PasteFeedback> {
     if reply["state"] != "ready" || reply["busy"] != false
         || reply["session_id"].as_str() != Some(id) { return None; }
     let state = app.state::<DesktopState>();
@@ -1175,18 +1596,20 @@ fn maybe_compatibility_paste(
         validate_reply(identity, current.as_ref(), reply).ok()?;
         let mut commands = state.commands.lock().ok()?;
         if !commands.experimental_paste || !commands.control.may_commit(id) { return None; }
+        let caret_shaping = commands.caret_shaping;
         // Taking this token makes every later observation inert, even if HTTP
         // reservation/completion fails or returns an idempotent replay.
         let Some(target) = commands.paste_target.take() else {
-            return Some("Automatic paste unavailable for the captured target. Copy the recoverable result manually.".into());
+            return Some(PasteFeedback::message("Automatic paste unavailable for the captured target. Copy the recoverable result manually."));
         };
         if target.session_id != id || reply["capture_id"] != target.capture_id
             || reply["result_session_id"].as_str() != Some(id)
             || reply["result_generation"] != reply["session_generation"] { return None; }
-        target
+        (target, caret_shaping)
     };
+    let (target, caret_shaping) = target;
     let Some(text) = reply["result"]["polished_text"].as_str().filter(|s| !s.trim().is_empty()) else {
-        return Some("Automatic paste skipped; copy the recoverable result manually.".into());
+        return Some(PasteFeedback::message("Automatic paste skipped; copy the recoverable result manually."));
     };
     let transaction = new_uuid().ok()?;
     let mut payload = serde_json::json!({"engine_id":identity.engine_id,"protocol_version":1,
@@ -1195,12 +1618,32 @@ fn maybe_compatibility_paste(
     let reserved = tauri::async_runtime::block_on(authenticated_request(
         app, identity, "POST", "/runtime/commit/reserve", Some(payload.clone())));
     let Ok(reserved) = reserved else {
-        return Some("Paste authorization uncertain; no paste was sent. Copy the result manually; restart the engine if it remains busy.".into());
+        return Some(PasteFeedback::message("Paste authorization uncertain; no paste was sent. Copy the result manually; restart the engine if it remains busy."));
     };
     if reserved["reservation_decision"] != "reserved" || reserved["write_authorized"] != true {
-        return Some("Automatic paste was not authorized. Copy the result manually.".into());
+        return Some(PasteFeedback::message("Automatic paste was not authorized. Copy the result manually."));
     }
-    let paste_result = {
+    // Waits at most for what is left of the caret read budget, outside shell locks.
+    let caret = if caret_shaping { state.caret.collect(id) } else { caret::CaretRead::Unknown };
+    let password = caret == caret::CaretRead::Password;
+    let shaped = match caret {
+        _ if !caret_shaping => None,
+        caret::CaretRead::Known(context) => Some(caret::shape(text, Some(&context))),
+        caret::CaretRead::Unknown => Some(caret::shape(text, None)),
+        caret::CaretRead::Password => None,
+    };
+    let paste_result = if password {
+        // Neither pasted nor placed on the clipboard.
+        windows_paste::PasteResult::skipped()
+    } else {
+        // Resolved before taking shell locks: hwnd() waits for the UI thread, and
+        // snapshotting the user's clipboard can wait on another program's rendering.
+        #[cfg(windows)]
+        let owner = app.get_webview_window("main")
+            .and_then(|window| window.hwnd().ok()).map(|handle| handle.0 as usize).unwrap_or(0);
+        #[cfg(not(windows))]
+        let owner = 0;
+        let plan = windows_paste::prepare_clipboard(owner);
         // Match lock order used by hotkey cancellation and engine shutdown. A
         // cancel already accepted locally suppresses delivery, even if reserve
         // raced it. Once this bounded native call starts, cancellation is too late.
@@ -1208,31 +1651,59 @@ fn maybe_compatibility_paste(
         let commands = state.commands.lock().ok();
         if current.as_ref().and_then(|v| v.as_ref()) != Some(identity)
             || !commands.as_ref().is_some_and(|c| c.control.may_commit(id)) {
+            drop((commands, current));
+            // An unused plan may re-arm a pending restore; never under shell locks.
+            drop(plan);
             windows_paste::PasteResult::skipped()
         } else {
-            #[cfg(windows)]
-            let owner = app.get_webview_window("main")
-                .and_then(|window| window.hwnd().ok()).map(|handle| handle.0 as usize).unwrap_or(0);
-            #[cfg(not(windows))]
-            let owner = 0;
-            windows_paste::paste(&target, text, owner)
+            windows_paste::paste(&target, text, shaped.as_deref(), plan)
         }
     };
     payload["outcome"] = serde_json::json!(paste_result.outcome);
     let completed = tauri::async_runtime::block_on(authenticated_request(
         app, identity, "POST", "/runtime/commit/complete", Some(payload)));
-    if !completed.as_ref().is_ok_and(|r| r["accepted"] == true) {
-        return Some(format!("Paste completion could not be recorded. Do not retry automatically; inspect the target and copy the recoverable result if needed. Restart the engine if busy. {}", paste_result.clipboard_message()));
+    let recorded = completed.as_ref().is_ok_and(|r| r["accepted"] == true);
+    if password && recorded {
+        return Some(PasteFeedback::message("Password field: nothing was pasted or copied."));
     }
-    let message = match paste_result.outcome {
-        "inserted_unverified" => "Paste sent, delivery unverified. Check the target.",
-        "delivery_uncertain" => "Paste delivery uncertain. Check the target before copying or pasting again.",
-        _ => "Automatic paste skipped because the target changed or was unavailable. Copy the result manually.",
-    };
-    Some(format!("{message} {}", paste_result.clipboard_message()))
+    Some(paste_feedback(&paste_result, recorded))
 }
 
-fn handle_mouse_button(app: &AppHandle, button: MouseButtonBinding, pressed: bool) {
+/// A sent paste ends quietly; only uncertain or failed outcomes explain themselves.
+fn paste_feedback(result: &windows_paste::PasteResult, recorded: bool) -> PasteFeedback {
+    let clipboard = result.clipboard_message();
+    let with_clipboard = |message: &str| {
+        Some(clipboard.map_or_else(|| message.to_string(), |note| format!("{message} {note}")))
+    };
+    if !recorded {
+        return PasteFeedback {
+            delivery: None,
+            message: with_clipboard("Paste completion could not be recorded. Check the target before pasting again; restart the engine if busy."),
+        };
+    }
+    match (result.outcome, &result.clipboard) {
+        ("inserted_unverified", _) => PasteFeedback { delivery: Some("pasted"), message: None },
+        ("delivery_uncertain", _) => PasteFeedback {
+            delivery: None,
+            message: with_clipboard("Paste may not have arrived. Check the target before pasting again."),
+        },
+        (_, windows_paste::ClipboardMutation::ResultInstalled) => PasteFeedback {
+            delivery: Some("clipboard"),
+            message: Some("Press Ctrl+V to paste it.".into()),
+        },
+        _ => PasteFeedback {
+            delivery: None,
+            message: with_clipboard("Automatic paste skipped; the target changed or was unavailable."),
+        },
+    }
+}
+
+fn handle_mouse_button(
+    app: &AppHandle,
+    input: &mut InputGesture,
+    button: MouseButtonBinding,
+    pressed: bool,
+) {
     let state = app.state::<DesktopState>();
     let hotkeys = match state.hotkeys.lock() {
         Ok(hotkeys) => hotkeys.clone(),
@@ -1249,11 +1720,7 @@ fn handle_mouse_button(app: &AppHandle, button: MouseButtonBinding, pressed: boo
     let Some(mode) = mode else {
         return;
     };
-    if pressed {
-        enqueue_session_command(app, &format!("mouse:{button:?}"), mode, "start");
-    } else {
-        enqueue_session_command(app, &format!("mouse:{button:?}"), mode, "stop");
-    }
+    input.binding_input(app, &format!("mouse:{button:?}"), mode, pressed);
 }
 
 #[cfg(windows)]
@@ -1288,8 +1755,23 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, w_param: WPARAM, l_param: L
             XBUTTON2 => Some(MouseButtonBinding::X2),
             _ => None,
         };
-        if let (Some(app), Some(button)) = (MOUSE_HOOK_APP.get(), button) {
-            handle_mouse_button(app, button, w_param as u32 == WM_XBUTTONDOWN);
+        // A low-level hook must return at once or Windows drops it; the input
+        // worker does the session work.
+        if let (Some(_), Some(button)) = (MOUSE_HOOK_APP.get(), button) {
+            post_input_event(InputEvent::Mouse {
+                button,
+                pressed: w_param as u32 == WM_XBUTTONDOWN,
+            });
+        }
+        let bound = match button {
+            Some(MouseButtonBinding::X1) => MOUSE_X1_BOUND.load(Ordering::Relaxed),
+            Some(MouseButtonBinding::X2) => MOUSE_X2_BOUND.load(Ordering::Relaxed),
+            None => false,
+        };
+        if bound {
+            // Swallow a bound side button so the focused app (for example a
+            // browser navigating back or forward) never sees it.
+            return 1;
         }
     }
     CallNextHookEx(std::ptr::null_mut(), code, w_param, l_param)
@@ -1422,7 +1904,11 @@ fn spawn_runtime_api(app: &AppHandle) -> Result<(), String> {
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
     // Store ownership before any readiness work that can fail.
-    *runtime = Some(command.spawn().map_err(|e| e.to_string())?);
+    let child = command.spawn().map_err(|e| e.to_string())?;
+    if !contain_runtime_child(&child) {
+        eprintln!("WezaFlow could not place the engine in its cleanup job.");
+    }
+    *runtime = Some(child);
     *state.engine_identity.lock().map_err(|e| e.to_string())? = Some(identity.clone());
     let result = wait_for_owned_runtime(
         app,
@@ -1687,6 +2173,93 @@ mod tests {
     }
 
     #[test]
+    fn only_bound_side_buttons_are_swallowed_and_failed_registration_clears_them() {
+        let mut current = test_hotkeys("Ctrl+Alt+B");
+        assert_eq!(bound_mouse_buttons(&current), (false, true));
+        let command_x1 = parse_registered_hotkeys(HotkeySettings {
+            dictation: vec!["Ctrl+Alt+B".into()],
+            command_mode: vec!["MouseX1".into()],
+        })
+        .unwrap();
+        assert_eq!(bound_mouse_buttons(&command_x1), (true, false));
+        let mut os = FakeHotkeyRegistrar {
+            fail_register_at: Some(1),
+            ..Default::default()
+        };
+        assert!(replace_hotkeys(&mut current, command_x1, false, &mut os).is_err());
+        assert_eq!(bound_mouse_buttons(&current), (false, false));
+    }
+
+    #[test]
+    fn sent_paste_is_quiet_and_undeliverable_text_points_to_ctrl_v() {
+        use windows_paste::{ClipboardMutation, PasteResult};
+        let result = |outcome, clipboard| PasteResult { outcome, clipboard };
+        let pasted = paste_feedback(&result("inserted_unverified", ClipboardMutation::RestoreScheduled), true);
+        assert_eq!(pasted, PasteFeedback { delivery: Some("pasted"), message: None });
+        let kept = paste_feedback(&result("inserted_unverified", ClipboardMutation::ResultInstalled), true);
+        assert_eq!(kept, PasteFeedback { delivery: Some("pasted"), message: None });
+        let fallback = paste_feedback(&result("not_attempted_recoverable", ClipboardMutation::ResultInstalled), true);
+        assert_eq!(fallback.delivery, Some("clipboard"));
+        assert!(fallback.message.unwrap().contains("Ctrl+V"));
+        let uncertain = paste_feedback(&result("delivery_uncertain", ClipboardMutation::ResultInstalled), true);
+        assert_eq!(uncertain.delivery, None);
+        assert!(uncertain.message.unwrap().contains("may not have arrived"));
+        let unchanged = paste_feedback(&PasteResult::skipped(), true);
+        assert_eq!(unchanged.delivery, None);
+        assert!(unchanged.message.unwrap().contains("not changed"));
+        let unrecorded = paste_feedback(&result("inserted_unverified", ClipboardMutation::RestoreScheduled), false);
+        assert_eq!(unrecorded.delivery, None);
+        assert!(unrecorded.message.unwrap().contains("could not be recorded"));
+    }
+
+    #[test]
+    fn recording_bar_hides_completed_feedback_without_hiding_a_new_recording() {
+        let mut lifetime = RecordingBarLifetime::default();
+        assert_eq!(lifetime.update("recording"), None);
+        let finished = lifetime.update("ready").unwrap();
+        assert!(lifetime.may_hide(finished));
+        assert_eq!(lifetime.update("ready"), None);
+        assert!(lifetime.may_hide(finished));
+        assert!(lifetime.dismiss(finished));
+        assert_eq!(lifetime.update("ready"), None);
+        assert!(lifetime.dismissed, "a repeated terminal status must stay hidden");
+        lifetime.update("recording");
+        assert!(!lifetime.dismissed);
+        assert!(!lifetime.may_hide(finished));
+        let failed = lifetime.update("error").unwrap();
+        assert!(lifetime.may_hide(failed));
+        lifetime.invalidate();
+        assert!(!lifetime.may_hide(failed));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn showing_feedback_never_activates_the_overlay_window() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::*;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
+        unsafe {
+            let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+            let window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, class.as_ptr(), class.as_ptr(),
+                WS_POPUP, -32000, -32000, 1, 1, std::ptr::null_mut(),
+                std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null());
+            assert!(!window.is_null());
+            let active = GetActiveWindow();
+            set_feedback_window_visible(window, true);
+            let after = GetActiveWindow();
+            let visible = IsWindowVisible(window);
+            set_feedback_window_visible(window, false);
+            let hidden = IsWindowVisible(window);
+            set_feedback_window_visible(window, true);
+            let reopened_active = GetActiveWindow();
+            DestroyWindow(window);
+            assert_ne!(visible, 0);
+            assert_eq!(hidden, 0);
+            assert_eq!(after, active, "feedback took keyboard focus from the target");
+            assert_eq!(reopened_active, active, "reopening feedback took keyboard focus");
+        }
+    }
+
+    #[test]
     fn hotkey_initial_unregister_failure_preserves_existing_bindings() {
         let original = test_hotkeys("Ctrl+Alt+B");
         let mut current = original.clone();
@@ -1878,6 +2451,7 @@ mod tests {
     }
 }
 
+mod caret;
 mod session;
 mod windows_paste;
 #[cfg(test)]

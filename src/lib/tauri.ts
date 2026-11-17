@@ -4,10 +4,13 @@ import type { HotkeySettings } from "./shortcuts";
 export type RecordingBarState = "idle" | "starting" | "recording" | "draining" | "processing" | "ready" | "no_speech" | "cancelled" | "error";
 export type RecordingBarMode = "dictation" | "command";
 
+export type RecordingBarDelivery = "pasted" | "clipboard";
+
 export type RecordingBarStatePayload = {
   state: RecordingBarState;
   mode: RecordingBarMode;
   message?: string | null;
+  delivery?: RecordingBarDelivery | null;
 };
 
 type TauriInternals = {
@@ -24,6 +27,14 @@ function tauriInternals(): TauriInternals | undefined {
 
 export function getDesktopWindowLabel(): string {
   return tauriInternals()?.metadata?.currentWindow?.label ?? "main";
+}
+
+export async function startDesktopRuntime(): Promise<void> {
+  if (!("__TAURI_INTERNALS__" in window)) {
+    return;
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("start_runtime_process");
 }
 
 export async function registerDesktopHotkeys(hotkeys: HotkeySettings): Promise<void> {

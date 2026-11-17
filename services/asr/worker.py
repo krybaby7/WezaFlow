@@ -1,7 +1,9 @@
 """Engine-owned, bounded, offline ASR process supervision.
 
 idle_timeout_seconds=0 releases the worker after each completed request.
-There is no queue: overlapping callers receive worker_busy.
+There is no queue: overlapping callers receive worker_busy. The one exception
+is a single decode arriving during warm(), which waits (bounded by the start-up
+budget) and then reuses the warmed worker.
 """
 from __future__ import annotations
 import base64
@@ -34,10 +36,15 @@ class AsrWorkerConfig:
     decode_timeout_seconds: float = 60
     idle_timeout_seconds: float = 60
     reap_timeout_seconds: float = 5
+    languages: tuple[str, ...] = ()
 
     def __post_init__(self):
         if not isinstance(self.snapshot,str):
             raise ValueError('worker_snapshot_invalid')
+        if isinstance(self.languages,list):
+            object.__setattr__(self,'languages',tuple(self.languages))
+        if not isinstance(self.languages,tuple) or len(self.languages) > 8 or any(not isinstance(code,str) or not 2 <= len(code) <= 3 or not code.isascii() or not code.isalpha() or not code.islower() for code in self.languages):
+            raise ValueError('worker_languages_invalid')
         validate_snapshot(self.snapshot)
         if self.device not in ('cpu','cuda') or self.compute_type not in ('default','auto','int8','int8_float32','int8_float16','int8_bfloat16','int16','float16','bfloat16','float32'):
             raise ValueError('worker_config_invalid')
@@ -81,6 +88,8 @@ class AsrWorkerService:
         self._error = None
         self._completion = 0
         self._provenance = None
+        self._owner = None
+        self._warm_waiter = False
 
     def transcriber(self, config):
         if not isinstance(config,AsrWorkerConfig):
@@ -246,9 +255,88 @@ class AsrWorkerService:
             self._provenance = _provenance(reply.get('provenance'))
             self._status = 'READY'
 
+    def _claim(self, owner):
+        with self._lock:
+            if not self._operation.acquire(False):
+                return False
+            self._owner = owner
+            return True
+
+    def _release(self):
+        with self._lock:
+            self._owner = None
+            self._operation.release()
+
+    def _claim_for_decode(self, config):
+        if self._claim('decode'):
+            return
+        # Only a single decode may wait behind an in-flight warm-up; any other
+        # overlap keeps the fail-fast contract.
+        with self._lock:
+            if self._owner != 'warm' or self._warm_waiter:
+                raise AsrWorkerError('worker_busy')
+            self._warm_waiter = True
+        try:
+            if not self._operation.acquire(timeout=config.startup_timeout_seconds+config.reap_timeout_seconds):
+                raise AsrWorkerError('worker_busy')
+            with self._lock:
+                self._owner = 'decode'
+        finally:
+            with self._lock:
+                self._warm_waiter = False
+
+    def _prepare(self, config):
+        """Resolve the config identity and reap a mismatched or exited worker."""
+        try:
+            if config.runtime_manifest and not 0 < Path(config.runtime_manifest).stat().st_size <= 1024*1024:
+                raise ValueError('worker_runtime_invalid')
+            runtime_hash = file_hash(config.runtime_manifest) if config.runtime_manifest else None
+        except Exception:
+            raise AsrWorkerError('worker_runtime_invalid') from None
+        identity = hashlib.sha256(json.dumps([asdict(config),runtime_hash],sort_keys=True).encode()).hexdigest()
+        process = self._process
+        if process is not None and (self._identity != identity or (process.pid is not None and not process.is_alive())):
+            if not self._reap(config.reap_timeout_seconds):
+                raise AsrWorkerError('worker_cleanup_incomplete')
+        return identity, runtime_hash
+
+    def warm(self, config):
+        """Start the worker for config without decoding caller audio; never raises."""
+        if not isinstance(config,AsrWorkerConfig) or config.idle_timeout_seconds == 0:
+            return False
+        if not self._claim('warm'):
+            return False
+        ready = False
+        try:
+            with self._lock:
+                if self._closed:
+                    return False
+            self._cancel_idle()
+            identity, runtime_hash = self._prepare(config)
+            try:
+                if self._process is None:
+                    self._start(config,identity,runtime_hash)
+                with self._lock:
+                    if self._status != 'READY' or self._closed:
+                        raise AsrWorkerError('worker_unavailable')
+                    # A warm-up is activity: an older idle callback must not reap it.
+                    self._completion += 1
+                ready = True
+            except Exception as exc:
+                with self._lock:
+                    self._error = str(exc) if isinstance(exc,AsrWorkerError) else 'worker_failed'
+                self._reap(config.reap_timeout_seconds)
+        except Exception:
+            ready = False
+        finally:
+            try:
+                self._schedule_idle(config)
+            finally:
+                self._release()
+        return ready
+
     def _transcribe(self, config, audio, language, initial_prompt):
-        if not self._operation.acquire(False):
-            raise AsrWorkerError('worker_busy')
+        self._claim_for_decode(config)
         try:
             with self._lock:
                 if self._closed:
@@ -260,16 +348,7 @@ class AsrWorkerService:
             for value, bound, allow_empty in ((language,64,False),(initial_prompt,2000,True)):
                 if value is not None and (not isinstance(value,str) or (not value and not allow_empty) or len(value)>bound or '\x00' in value):
                     raise ValueError('worker_text_option_invalid')
-            try:
-                if config.runtime_manifest and not 0 < Path(config.runtime_manifest).stat().st_size <= 1024*1024:
-                    raise ValueError('worker_runtime_invalid')
-                runtime_hash = file_hash(config.runtime_manifest) if config.runtime_manifest else None
-            except Exception:
-                raise AsrWorkerError('worker_runtime_invalid') from None
-            identity = hashlib.sha256(json.dumps([asdict(config),runtime_hash],sort_keys=True).encode()).hexdigest()
-            if self._process is not None and self._identity != identity:
-                if not self._reap(config.reap_timeout_seconds):
-                    raise AsrWorkerError('worker_cleanup_incomplete')
+            identity, runtime_hash = self._prepare(config)
             try:
                 if self._process is None:
                     self._start(config,identity,runtime_hash)
@@ -299,9 +378,11 @@ class AsrWorkerService:
         finally:
             # Install the sole timer while still owning the operation. A timer
             # checks the operation and completion generation before unloading.
-            if config.idle_timeout_seconds > 0:
-                self._schedule_idle(config)
-            self._operation.release()
+            try:
+                if config.idle_timeout_seconds > 0:
+                    self._schedule_idle(config)
+            finally:
+                self._release()
 
 def _result(value):
     if not isinstance(value,dict) or set(value) != {'text','language','duration_ms','inference_ms','queue_ms','audio_duration_ms'}:

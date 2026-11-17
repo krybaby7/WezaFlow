@@ -1,5 +1,21 @@
 # Wezza implementation progress
 
+## 10 November 2026 — First working trial build
+
+The packaged trial froze on every keyboard hotkey press, so no dictation had ever reached the engine. Cause: tauri-plugin-global-shortcut calls the handler while holding its shortcut-table mutex (for a press, on the UI thread), and the handler registered Escape from inside it. Fix in `src-tauri/src/lib.rs`: OS hooks only post events to an input worker thread; the UI thread never takes shell locks (`register_hotkeys` / `configure_desktop_settings` are async commands, plugin bulk calls go through `on_main_thread`); the engine child runs in a kill-on-close job object so it cannot outlive the shell.
+
+Added the same day, all uncommitted on `codex/local-trilingual-recovery`:
+
+- **Engine:** speech and editor workers warm at engine start and at key-down (`warm()` on both services, `warm_local_models` in `services/runtime/api.py`); `local_asr.languages` restricts auto-detection; worker decodes with `condition_on_previous_text=False`; a missing editor service falls back to raw text.
+- **Audio:** numpy fast paths in capture, WAV conversion, VAD and stats, imported lazily so spawned workers do not pay for numpy at start-up; optional `audio.release_tail_ms` capture tail (0–500, off when absent).
+- **Shell:** clipboard snapshot and restore-if-unchanged, clipboard-history exclusion formats, text left on the clipboard when the target changed, quiet successful pastes, bound side buttons swallowed, tap discard and hands-free lock (`PressGesture` in `session.rs`), caret-context text shaping with a bounded UI Automation read and password-field refusal (`caret.rs`, setting `runtime.caret_shaping`).
+
+Verification: Python 485, frontend 51, Rust 59 tests pass. On the desktop the packaged build started, loaded both models (GPU memory about 2.4 GB to 8.9 GB), turned synthetic hotkey and side-button input into start/cancel and start/stop commands without freezing, and released everything when force-closed. No real speech has been dictated through it. Clipboard restore, text shaping in real applications, the hands-free gesture, recognition accuracy and the unqualified local editor remain open; the read-me in `scripts/personal_trial/` lists the manual checks.
+
+Trial config (`artifacts/Wezza-Personal-Trial/project/config/settings.yaml` in the original checkout): MouseX2 plus Ctrl+Shift+Alt+F11 (Ctrl+Alt+Space is owned by another program on this PC), languages en/fr/ar, one-hour model retention, 200 ms tail, automatic paste and caret shaping on. Rebuild with `npm run build`, then `cargo build --release --locked --offline --manifest-path src-tauri/Cargo.toml --target-dir src-tauri/target --features tauri/custom-protocol`, then `scripts/assemble_personal_trial.py --exe src-tauri/target/release/localflow.exe`.
+
+Known and left alone: global-hotkey's release detection spins one CPU core while a keyboard hotkey is held.
+
 ## 29 October 2026 — Personal trial handoff requested
 
 The user asked to finish implementation and leave testing to them. Further desktop, microphone, model and automated test runs stopped. Final compilation, packaging and static inspection continue; the earlier suite results below do not validate this new integration. The handoff is a runnable experimental build, not a claim that it replaces Wispr Flow or passes the speech, power, offline-denied or daily-use gates.

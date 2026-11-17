@@ -1,24 +1,61 @@
 # Wezza personal trial — this PC
 
-Double-click **Launch Wezza.vbs**. Keep this folder on this PC: it uses the original WEZZA Python environment, cached speech model and local CUDA files. The large editor/runtime assets are hardlinks; do not edit these files. Nothing was registered to run at Windows startup.
+Double-click **Launch Wezza.vbs**. Keep this folder on this PC: it uses the original WEZZA Python environment, the cached speech model and the local CUDA files. Nothing is registered to run at Windows startup, and nothing leaves this PC.
 
-Wait for **Runtime API connected** before recording. Hold **Ctrl+Shift+Alt+F11**, wait for the recording indicator, speak, then release **all four keys**. You can change this binding in Hotkeys and Save settings. No microphone recording starts just by launching. The first utterance loads and verifies both models and may take considerably longer than the second. **Ctrl+Shift+Alt+F12 command editing is unavailable** in this trial.
+## Starting
 
-Start with the app's own results. Compare **raw transcript** with **final/edited text**, and use the copy controls to keep examples. History is off. Automatic paste is off by default. The existing Qwen3.5-9B editor is experimental and has known failed cases: grammar, self-corrections and Arabizi are not qualified. A fluent-looking edit can still change your meaning; raw text is your reference.
+The window shows **Runtime API connected** once the engine is up. The speech model and the editing model start loading at launch; give them about 20 seconds. You can dictate sooner, but that first result waits for the load. While loaded they hold roughly 6.5 GB of GPU memory, and they unload after an hour without dictation (the next key press starts loading them again).
 
-Try these six short recordings, each separately. Judge intended meaning and language/script; do not require one exact spelling for Arabizi.
+## Dictating
 
-1. English: “I, I need to send the report. He don't have it yet.” Aim for “I need to send the report. He doesn't have it yet.”
-2. French: “Bonjour, je voudrais confirmer notre rendez-vous demain, pardon, vendredi à dix heures.” Keep French; the intended day is Friday, time ten.
-3. Arabic: “من فضلك ابعتلي التقرير بكرة الساعة خمسة.” Keep Arabic meaning, tomorrow and five.
-4. Arabic-first mixed sentence: “ابعتلي the final report بكرة before lunch.” Arabic spans should stay Arabic and English spans Latin; preserve the deadline.
-5. Self-correction: “Let's meet on Monday, sorry, Tuesday at four.” Intended day is Tuesday, time four.
-6. English-first mixed sentence: “I need حاجة صغيرة before lunch.” The entire result should use Latin script, including numeric Arabizi such as “7aga soghayara”. Judge meaning rather than insisting on that exact spelling. Repeat with a French opening of your choice.
+- **Hold the mouse "forward" side button (MouseX2)**, speak, release. Keyboard alternative: **Ctrl+Shift+Alt+F11**. Change either in the Hotkeys tab. Ctrl+Alt+Space is not offered because another program on this PC already owns it.
+- Hold for at least half a second. A shorter tap is discarded with a "hold to dictate" hint.
+- **Hands-free:** tap, then press again within half a second. Recording continues without holding; press once more to finish.
+- **Escape** cancels a recording.
+- While Wezza runs, the side button no longer acts as "forward" in the browser. If Wispr Flow is bound to the same button or keys, both will react: quit one, or give them different bindings.
 
-After ordinary dictation works, optionally enable **experimental automatic paste** in the app and try an empty, unsent normal text field in Codex, Claude, Comet, a document, a sheet, or an email draft. Keep focus in that field while dictating. Do not click Send/Submit. Paste and focus-race behavior remains unverified; some password fields may not be recognized, and copied text can remain on your clipboard. Disable the option again when finished.
+## What happens to the text
 
-Also try **Escape** during a recording, switching to another application before completion, a silent recording, and waiting over one minute idle before another utterance. Confirm no unwanted insertion, no unexpected recording, and that the next recording still works. Moving between two fields inside the same browser window may evade the experimental paste checks: keep automatic paste off if that is a concern. Check idle worker status and your usual fan/power experience.
+- **Automatic paste is on.** The text is pasted into the field that had focus when you pressed the key. Wezza never presses Enter.
+- Your clipboard is put back about 0.7 seconds after the paste, unless you copied something else in the meantime. Dictated text is marked to stay out of Win+V history.
+- If the window changed before the text was ready, nothing is pasted: the bar says **Copied to clipboard** and Ctrl+V pastes it where you want.
+- **Fit to surrounding text** is on: mid-sentence the first letter is lowercased, spaces are added where needed, and a final period is dropped when text follows. Where an app does not expose its text (terminals, some editors), only a trailing space is added.
+- Fields that report themselves as password fields are refused.
+- Both options are in the Dictation tab, next to **Local cleanup**.
 
-To stop, use the tray icon's **Quit WezaFlow**. The window's X only hides it. Before sharing logs, check them for dictated text or other private material.
+The app window always keeps the last result: the **final text**, the **raw transcript** under it, and a copy button for each. History is off.
 
-For each problem, report **what you said, raw text, final text, what went wrong, language, target app, and rough timing** (first/cold or later/warm). Include a screenshot and relevant logs if useful: `logs` holds desktop output; `project/artifacts/logs` holds API/runtime output. If launch fails, read the popup and these logs. This package was assembled without launching, microphone checks, or model trials; all hands-on testing is yours.
+## What is still unproven
+
+- The local cleanup model (Qwen3.5-9B) is experimental. In earlier trials it missed some spoken corrections and the Arabizi rule. A fluent-looking edit can still change your meaning; the raw transcript is your reference. Turn **Local cleanup** off to get recognition only.
+- Recognition has not yet been measured on your French, Egyptian Arabic or mixed speech. Language detection is limited to English, French and Arabic.
+- Command editing (Ctrl+Shift+Alt+F12) is unavailable.
+
+## Six short recordings to start with
+
+Judge intended meaning and language/script; do not require one exact spelling for Arabizi.
+
+1. English: "I, I need to send the report. He don't have it yet." Aim: "I need to send the report. He doesn't have it yet."
+2. French: "Bonjour, je voudrais confirmer notre rendez-vous demain, pardon, vendredi à dix heures." Keep French; the day is Friday, the time ten.
+3. Arabic: "من فضلك ابعتلي التقرير بكرة الساعة خمسة." Keep the Arabic meaning, tomorrow and five.
+4. Arabic-first mixed: "ابعتلي the final report بكرة before lunch." Arabic stays Arabic, English stays Latin; keep the deadline.
+5. Self-correction: "Let's meet on Monday, sorry, Tuesday at four." The day is Tuesday, the time four.
+6. English-first mixed: "I need حاجة صغيرة before lunch." The whole result should be in Latin script, with numeric Arabizi such as "7aga soghayara".
+
+## Things worth checking
+
+- **Speed:** time from release to text, right after launch and again later; and after more than an hour idle.
+- **Clipboard:** copy something, dictate, wait a second, press Ctrl+V — you should get what you copied, not the dictation. Try it with an image and with an Excel range too. Check Win+V does not list dictated text.
+- **Wrong window:** switch windows before the text arrives; you should see "Copied to clipboard" and nothing pasted.
+- **Fitting:** dictate into the middle of a sentence; dictate twice in a row; try Notepad, a browser text box, your chat apps, a document and a terminal.
+- **Last word:** release the key as you finish speaking and check the final word is still there.
+- **Silence and noise:** hold the key without speaking, or while typing; nothing should be pasted.
+- **Password field:** try a browser login field; nothing should be pasted or copied.
+- **Hands-free and Escape** as described above.
+- Fan noise and responsiveness of your other apps while Wezza is running.
+
+## Stopping and reporting
+
+Use the tray icon's **Quit WezaFlow**; the window's X only hides it. If the app is ever force-closed, its engine and models are shut down with it.
+
+For each problem, note **what you said, the raw transcript, the final text, what went wrong, the language, the target app, and rough timing**. Logs: `logs` holds desktop output; `project/artifacts/logs` holds engine output. Check logs for dictated text before sharing them.
