@@ -8,6 +8,7 @@ from time import monotonic, perf_counter
 from services.config.settings import DEFAULT_SETTINGS
 from services.llm.constrained_editor import ConstrainedEditor, EditRequest
 from services.llm.local_worker import LocalEditorConfig, LocalEditorService
+from services.llm.spoken_revisions import resolve_spoken_revision
 from services.pipeline.models import FormatResult
 
 
@@ -142,6 +143,13 @@ class LocalCleanupFormatter:
         started = perf_counter()
         text = raw_text
         outcome, reason = 'raw_fallback', self.reason
+        revision = resolve_spoken_revision(raw_text) if self.editor is not None else None
+        if revision is not None:
+            self.last_diagnostics = {'outcome': 'edited', 'reason': 'deterministic_spoken_revision',
+                                     'qualification': 'experimental_unqualified'}
+            return FormatResult(text=revision, model='local-spoken-revision',
+                                duration_ms=round((perf_counter() - started) * 1000))
+
         if self.editor is not None:
             try:
                 hints = vocabulary_hints if isinstance(vocabulary_hints, (list, tuple)) else ()
