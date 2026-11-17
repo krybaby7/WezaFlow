@@ -284,6 +284,26 @@ pre {
   white-space: nowrap;
 }
 
+.delivery-recovery .recording-pill,
+.delivery-requested .recording-pill {
+  grid-template-columns: 10px minmax(0, 1fr);
+  height: auto;
+  min-height: 42px;
+  padding-block: 7px;
+}
+
+.delivery-recovery .recording-waveform,
+.delivery-recovery .recording-status-mark,
+.delivery-requested .recording-waveform,
+.delivery-requested .recording-status-mark {
+  display: none;
+}
+
+.delivery-recovery .recording-label small {
+  white-space: normal;
+}
+
+
 .recording-timer,
 .recording-status-mark {
   color: #cfe1dc;

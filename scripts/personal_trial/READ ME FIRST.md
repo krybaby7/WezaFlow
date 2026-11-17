@@ -16,11 +16,11 @@ The window shows **Runtime API connected** once the engine is up. The speech mod
 
 ## What happens to the text
 
-- **Automatic paste is on.** The text is pasted into the field that had focus when you pressed the key. Wezza never presses Enter.
-- Your clipboard is put back about 0.7 seconds after the paste, unless you copied something else in the meantime. Dictated text is marked to stay out of Win+V history.
-- If the window changed before the text was ready, nothing is pasted: the bar says **Copied to clipboard** and Ctrl+V pastes it where you want.
-- **Fit to surrounding text** is on: mid-sentence the first letter is lowercased, spaces are added where needed, and a final period is dropped when text follows. Where an app does not expose its text (terminals, some editors), only a trailing space is added.
-- Fields that report themselves as password fields are refused.
+- **Automatic paste is on.** Wezza requests Ctrl+V when it can identify the same writable, non-sensitive field at the start and end of dictation. It never presses Enter.
+- **Paste requested** means Windows accepted the shortcut. Check that the text arrived before trying again.
+- After a paste request Wezza tries to restore your previous clipboard in about 0.7 seconds. A newer copy always takes precedence. Wezza marks its automatic clipboard writes to stay out of Win+V history.
+- If the focused field changed, reports itself as a password field, or cannot be identified, Wezza skips the automatic paste. Read the reason in the bar and use **Copy result** in Wezza. Some editors do not expose enough information for automatic paste.
+- **Fit to surrounding text** adjusts capitalisation, spacing and punctuation when a supported editor exposes the caret context. This setting does not change the safety checks for automatic paste.
 - Both options are in the Dictation tab, next to **Local cleanup**.
 
 The app window always keeps the last result: the **final text**, the **raw transcript** under it, and a copy button for each. History is off.
@@ -45,8 +45,8 @@ Judge intended meaning and language/script; do not require one exact spelling fo
 ## Things worth checking
 
 - **Speed:** time from release to text, right after launch and again later; and after more than an hour idle.
-- **Clipboard:** copy something, dictate, wait a second, press Ctrl+V — you should get what you copied, not the dictation. Try it with an image and with an Excel range too. Check Win+V does not list dictated text.
-- **Wrong window:** switch windows before the text arrives; you should see "Copied to clipboard" and nothing pasted.
+- **Clipboard:** copy something, dictate, wait a second, press Ctrl+V — you should get what you copied, not the dictation. Try an image or Excel range too. Wezza skips automatic paste when it cannot preserve all the clipboard formats. Check that Win+V omits text used for automatic paste.
+- **Changed focus:** switch windows or move to another field in the same window before the text arrives. Expect **Ready to copy** with a reason. Recover the draft with **Copy result**.
 - **Fitting:** dictate into the middle of a sentence; dictate twice in a row; try Notepad, a browser text box, your chat apps, a document and a terminal.
 - **Last word:** release the key as you finish speaking and check the final word is still there.
 - **Silence and noise:** hold the key without speaking, or while typing; nothing should be pasted.

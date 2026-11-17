@@ -4,7 +4,7 @@ import type { HotkeySettings } from "./shortcuts";
 export type RecordingBarState = "idle" | "starting" | "recording" | "draining" | "processing" | "ready" | "no_speech" | "cancelled" | "error";
 export type RecordingBarMode = "dictation" | "command";
 
-export type RecordingBarDelivery = "pasted" | "clipboard";
+export type RecordingBarDelivery = "requested" | "recovery";
 
 export type RecordingBarStatePayload = {
   state: RecordingBarState;

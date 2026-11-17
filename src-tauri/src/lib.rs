@@ -166,8 +166,6 @@ struct DesktopState {
     audio_ducking_settings: Mutex<AudioDuckingSettings>,
     commands: Mutex<ShellCommands>,
     recording_bar: Mutex<RecordingBarLifetime>,
-    /// Never locked while waiting for a read; see `CaretReads::collect`.
-    caret: caret::CaretReads,
 }
 
 #[derive(Default)]
@@ -215,7 +213,7 @@ struct RecordingBarStatePayload {
     state: String,
     mode: String,
     message: Option<String>,
-    /// "pasted" or "clipboard" once automatic paste settled a ready result.
+    /// A shortcut request is distinct from verified delivery.
     delivery: Option<String>,
 }
 
@@ -267,8 +265,8 @@ struct PasteFeedback {
 }
 
 impl PasteFeedback {
-    fn message(message: impl Into<String>) -> Self {
-        Self { delivery: None, message: Some(message.into()) }
+    fn recovery(message: impl Into<String>) -> Self {
+        Self { delivery: Some("recovery"), message: Some(message.into()) }
     }
 }
 
@@ -1240,7 +1238,7 @@ fn show_recording_bar_with_delivery(
         eprintln!("WezaFlow could not show recording bar: {err}");
     }
     if let Some(revision) = revision {
-        let delay = if message.is_some() || state == "error" {
+        let delay = if (message.is_some() && delivery != Some("requested")) || state == "error" {
             Duration::from_secs(5)
         } else {
             Duration::from_millis(1500)
@@ -1320,19 +1318,7 @@ fn enqueue_session_command(app: &AppHandle, request: SessionRequest) -> Option<S
             command
         }
         SessionRequest::Stop { binding } => {
-            let command = commands.control.release(binding);
-            // Read the caret while the engine transcribes; collected at paste time.
-            let target = command.as_ref().and_then(|command| {
-                commands.paste_target.as_ref().filter(|target| {
-                    commands.experimental_paste
-                        && commands.caret_shaping
-                        && target.session_id == command.session_id
-                })
-            });
-            if let Some(target) = target {
-                state.caret.start(&target.session_id, target.process_id());
-            }
-            command
+            commands.control.release(binding)
         }
         SessionRequest::Cancel => commands.control.cancel(),
         SessionRequest::DiscardTap { session_id, hint } => {
@@ -1600,16 +1586,20 @@ fn maybe_compatibility_paste(
         // Taking this token makes every later observation inert, even if HTTP
         // reservation/completion fails or returns an idempotent replay.
         let Some(target) = commands.paste_target.take() else {
-            return Some(PasteFeedback::message("Automatic paste unavailable for the captured target. Copy the recoverable result manually."));
+            eprintln!("Paste decision: NoCapturedTarget");
+            return Some(PasteFeedback::recovery("No focused field was captured at key-down. Copy the result from Wezza."));
         };
         if target.session_id != id || reply["capture_id"] != target.capture_id
             || reply["result_session_id"].as_str() != Some(id)
-            || reply["result_generation"] != reply["session_generation"] { return None; }
+            || reply["result_generation"] != reply["session_generation"] {
+            eprintln!("Paste decision: CaptureMismatch");
+            return Some(PasteFeedback::recovery("The result did not match the captured field. Copy the result from Wezza."));
+        }
         (target, caret_shaping)
     };
     let (target, caret_shaping) = target;
     let Some(text) = reply["result"]["polished_text"].as_str().filter(|s| !s.trim().is_empty()) else {
-        return Some(PasteFeedback::message("Automatic paste skipped; copy the recoverable result manually."));
+        return Some(PasteFeedback::recovery("There was no usable text for automatic paste. Check the result in Wezza."));
     };
     let transaction = new_uuid().ok()?;
     let mut payload = serde_json::json!({"engine_id":identity.engine_id,"protocol_version":1,
@@ -1618,84 +1608,66 @@ fn maybe_compatibility_paste(
     let reserved = tauri::async_runtime::block_on(authenticated_request(
         app, identity, "POST", "/runtime/commit/reserve", Some(payload.clone())));
     let Ok(reserved) = reserved else {
-        return Some(PasteFeedback::message("Paste authorization uncertain; no paste was sent. Copy the result manually; restart the engine if it remains busy."));
+        return Some(PasteFeedback::recovery("Paste authorization was unavailable. Copy the result from Wezza. Restart Wezza if it stays busy."));
     };
     if reserved["reservation_decision"] != "reserved" || reserved["write_authorized"] != true {
-        return Some(PasteFeedback::message("Automatic paste was not authorized. Copy the result manually."));
+        return Some(PasteFeedback::recovery("Paste was not authorized. Copy the result from Wezza."));
     }
-    // Waits at most for what is left of the caret read budget, outside shell locks.
-    let caret = if caret_shaping { state.caret.collect(id) } else { caret::CaretRead::Unknown };
-    let password = caret == caret::CaretRead::Password;
-    let shaped = match caret {
-        _ if !caret_shaping => None,
-        caret::CaretRead::Known(context) => Some(caret::shape(text, Some(&context))),
-        caret::CaretRead::Unknown => Some(caret::shape(text, None)),
-        caret::CaretRead::Password => None,
-    };
-    let paste_result = if password {
-        // Neither pasted nor placed on the clipboard.
-        windows_paste::PasteResult::skipped()
-    } else {
-        // Resolved before taking shell locks: hwnd() waits for the UI thread, and
-        // snapshotting the user's clipboard can wait on another program's rendering.
+    use windows_paste::{PasteReason, PasteResult};
+    let paste_result = (|| {
+        // A sensitive, unknown or already-changed field never triggers clipboard rendering.
+        let editor = target.qualify()?;
+        // Snapshot outside shell locks. Delayed clipboard formats can wait on another app.
         #[cfg(windows)]
         let owner = app.get_webview_window("main")
             .and_then(|window| window.hwnd().ok()).map(|handle| handle.0 as usize).unwrap_or(0);
         #[cfg(not(windows))]
         let owner = 0;
         let plan = windows_paste::prepare_clipboard(owner);
-        // Match lock order used by hotkey cancellation and engine shutdown. A
-        // cancel already accepted locally suppresses delivery, even if reserve
-        // raced it. Once this bounded native call starts, cancellation is too late.
+        let context = target.revalidate(&editor, caret_shaping)?;
+        let preserve_initial_case = reply["result"]["diagnostics"]["preserve_initial_case"]
+            .as_bool().unwrap_or(false);
+        let shaped = caret_shaping.then(|| caret::shape(text, context.as_ref(), preserve_initial_case));
         let current = state.engine_identity.lock().ok();
         let commands = state.commands.lock().ok();
         if current.as_ref().and_then(|v| v.as_ref()) != Some(identity)
             || !commands.as_ref().is_some_and(|c| c.control.may_commit(id)) {
             drop((commands, current));
-            // An unused plan may re-arm a pending restore; never under shell locks.
             drop(plan);
-            windows_paste::PasteResult::skipped()
-        } else {
-            windows_paste::paste(&target, text, shaped.as_deref(), plan)
+            return Err(PasteReason::Cancelled);
         }
-    };
-    payload["outcome"] = serde_json::json!(paste_result.outcome);
+        Ok(windows_paste::paste(&target, shaped.as_deref().unwrap_or(text), plan))
+    })().unwrap_or_else(PasteResult::skipped);
+    eprintln!("Paste decision: {:?}, clipboard: {:?}", paste_result.reason, paste_result.clipboard);
+    payload["outcome"] = serde_json::json!(paste_result.reason.outcome());
     let completed = tauri::async_runtime::block_on(authenticated_request(
         app, identity, "POST", "/runtime/commit/complete", Some(payload)));
     let recorded = completed.as_ref().is_ok_and(|r| r["accepted"] == true);
-    if password && recorded {
-        return Some(PasteFeedback::message("Password field: nothing was pasted or copied."));
-    }
     Some(paste_feedback(&paste_result, recorded))
 }
 
-/// A sent paste ends quietly; only uncertain or failed outcomes explain themselves.
 fn paste_feedback(result: &windows_paste::PasteResult, recorded: bool) -> PasteFeedback {
-    let clipboard = result.clipboard_message();
-    let with_clipboard = |message: &str| {
-        Some(clipboard.map_or_else(|| message.to_string(), |note| format!("{message} {note}")))
+    use windows_paste::{ClipboardMutation, PasteReason};
+    let message = if !recorded {
+        "Paste completion could not be recorded. Check the target before pasting again; restart Wezza if busy.".into()
+    } else {
+        match result.reason {
+            PasteReason::InputSent => result.reason.message().into(),
+            PasteReason::InputPartial => format!("{} Check the field before copying the result from Wezza.", result.reason.message()),
+            reason => format!("{} Copy the result from Wezza.", reason.message()),
+        }
     };
-    if !recorded {
-        return PasteFeedback {
-            delivery: None,
-            message: with_clipboard("Paste completion could not be recorded. Check the target before pasting again; restart the engine if busy."),
-        };
-    }
-    match (result.outcome, &result.clipboard) {
-        ("inserted_unverified", _) => PasteFeedback { delivery: Some("pasted"), message: None },
-        ("delivery_uncertain", _) => PasteFeedback {
-            delivery: None,
-            message: with_clipboard("Paste may not have arrived. Check the target before pasting again."),
-        },
-        (_, windows_paste::ClipboardMutation::ResultInstalled) => PasteFeedback {
-            delivery: Some("clipboard"),
-            message: Some("Press Ctrl+V to paste it.".into()),
-        },
-        _ => PasteFeedback {
-            delivery: None,
-            message: with_clipboard("Automatic paste skipped; the target changed or was unavailable."),
-        },
-    }
+    let message = if result.clipboard == ClipboardMutation::RestoreFailed {
+        format!("{message} Wezza could not restore the previous clipboard.")
+    } else {
+        message
+    };
+    let delivery = if recorded && result.reason == PasteReason::InputSent {
+        Some("requested")
+    } else {
+        Some("recovery")
+    };
+    PasteFeedback { delivery, message: Some(message) }
 }
 
 fn handle_mouse_button(
@@ -1809,24 +1781,42 @@ async fn authenticated_request(
                 .map_err(|e| e.to_string())
         },
         async {
-            let mut request = client
-                .request(method, format!("{RUNTIME_BASE_URL}{path}"))
-                .bearer_auth(&identity.token);
-            if let Some(body) = body {
-                request = request.json(&body);
+            let complete = method == reqwest::Method::POST && path == "/runtime/commit/complete";
+            let mut retry = complete;
+            loop {
+                let mut request = client
+                    .request(method.clone(), format!("{RUNTIME_BASE_URL}{path}"))
+                    .bearer_auth(&identity.token);
+                if let Some(body) = &body {
+                    request = request.json(body);
+                }
+                if complete {
+                    request = request.timeout(Duration::from_secs(1));
+                }
+                let response = async {
+                    request.send().await?.error_for_status()?.json::<serde_json::Value>().await
+                }.await;
+                match response {
+                    Ok(value) => return Ok(value),
+                    Err(error) if retry && retry_completion_transport(&error) => {
+                        // Only repeat the idempotent completion payload. Native input
+                        // already settled and can never run on this path.
+                        retry = false;
+                        if current_identity(app)? != *identity {
+                            return Err("The runtime engine changed.".into());
+                        }
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
             }
-            request
-                .send()
-                .await
-                .map_err(|e| e.to_string())?
-                .error_for_status()
-                .map_err(|e| e.to_string())?
-                .json::<serde_json::Value>()
-                .await
-                .map_err(|e| e.to_string())
         },
     )
     .await
+}
+
+fn retry_completion_transport(error: &reqwest::Error) -> bool {
+    !error.is_status() && !error.is_decode()
+        && (error.is_timeout() || error.is_connect() || error.is_request() || error.is_body())
 }
 
 #[cfg(windows)]
@@ -2191,25 +2181,22 @@ mod tests {
     }
 
     #[test]
-    fn sent_paste_is_quiet_and_undeliverable_text_points_to_ctrl_v() {
-        use windows_paste::{ClipboardMutation, PasteResult};
-        let result = |outcome, clipboard| PasteResult { outcome, clipboard };
-        let pasted = paste_feedback(&result("inserted_unverified", ClipboardMutation::RestoreScheduled), true);
-        assert_eq!(pasted, PasteFeedback { delivery: Some("pasted"), message: None });
-        let kept = paste_feedback(&result("inserted_unverified", ClipboardMutation::ResultInstalled), true);
-        assert_eq!(kept, PasteFeedback { delivery: Some("pasted"), message: None });
-        let fallback = paste_feedback(&result("not_attempted_recoverable", ClipboardMutation::ResultInstalled), true);
-        assert_eq!(fallback.delivery, Some("clipboard"));
-        assert!(fallback.message.unwrap().contains("Ctrl+V"));
-        let uncertain = paste_feedback(&result("delivery_uncertain", ClipboardMutation::ResultInstalled), true);
-        assert_eq!(uncertain.delivery, None);
-        assert!(uncertain.message.unwrap().contains("may not have arrived"));
-        let unchanged = paste_feedback(&PasteResult::skipped(), true);
-        assert_eq!(unchanged.delivery, None);
-        assert!(unchanged.message.unwrap().contains("not changed"));
-        let unrecorded = paste_feedback(&result("inserted_unverified", ClipboardMutation::RestoreScheduled), false);
-        assert_eq!(unrecorded.delivery, None);
-        assert!(unrecorded.message.unwrap().contains("could not be recorded"));
+    fn sent_paste_does_not_claim_verified_delivery() {
+        use windows_paste::{ClipboardMutation, PasteReason, PasteResult};
+        let sent = paste_feedback(&PasteResult::skipped(PasteReason::InputSent), true);
+        assert_eq!(sent.delivery, Some("requested"));
+        assert!(sent.message.unwrap().contains("unverified"));
+        let uncertain = paste_feedback(&PasteResult::skipped(PasteReason::InputPartial), true);
+        assert!(uncertain.message.unwrap().contains("Check the field"));
+        let changed = paste_feedback(&PasteResult::skipped(PasteReason::ChangedTarget), true);
+        assert_eq!(changed.delivery, Some("recovery"));
+        assert!(changed.message.unwrap().contains("focused field changed"));
+        let unrecorded = paste_feedback(&PasteResult {
+            reason: PasteReason::InputSent,
+            clipboard: ClipboardMutation::RestoreFailed,
+        }, false);
+        assert!(unrecorded.message.as_ref().unwrap().contains("could not be recorded"));
+        assert!(unrecorded.message.unwrap().contains("could not restore"));
     }
 
     #[test]

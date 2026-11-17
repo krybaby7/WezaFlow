@@ -134,8 +134,8 @@ const RECORDING_BAR_LABELS: Record<RecordingBarStatePayload["state"], string> = 
 };
 
 const RECORDING_BAR_DELIVERY_LABELS: Record<NonNullable<RecordingBarStatePayload["delivery"]>, string> = {
-  pasted: "Pasted",
-  clipboard: "Copied to clipboard"
+  requested: "Paste requested",
+  recovery: "Ready to copy"
 };
 
 function supportedLanguagesForProfile(profile: string): readonly string[] | null {
@@ -580,7 +580,7 @@ function RecordingFeedbackBar() {
   const delivery = barState.state === "ready" ? barState.delivery ?? null : null;
   const label = delivery ? RECORDING_BAR_DELIVERY_LABELS[delivery] : RECORDING_BAR_LABELS[barState.state];
   const statusMark =
-    barState.state === "ready" ? "OK" : barState.state === "error" ? "!" : "";
+    barState.state === "error" ? "!" : "";
 
   return (
     <main className={`recording-bar-root state-${barState.state}${delivery ? ` delivery-${delivery}` : ""}`}>
@@ -1042,7 +1042,7 @@ function DictationPanel({
       <fieldset>
         <legend>Automatic paste trial</legend>
         <label><input type="checkbox" checked={settings.runtime.experimental_automatic_paste ?? false} onChange={(event) => onSettings({...settings, runtime: {...settings.runtime, experimental_automatic_paste: event.target.checked}})} /> Enable experimental automatic paste</label>
-        <p>Pastes with Ctrl+V after dictation, then puts back what was on your clipboard unless you copy something else first. Dictated text is kept out of clipboard history. If the text cannot be pasted, it stays on the clipboard so you can press Ctrl+V yourself. Focus checks cannot prevent every race or detect every password field. Use ordinary, non-sensitive text fields and keep the caret still. Delivery is unverified; check the destination before trying again. Leave this off to use Copy result.</p>
+        <p>Wezza requests Ctrl+V when the same writable, non-sensitive field is still focused. It tries to restore your previous clipboard and keeps any newer copy you make. If a check fails, use Copy result in Wezza. Check the destination before pasting again because delivery is unverified.</p>
         <label><input type="checkbox" checked={settings.runtime.caret_shaping ?? true} disabled={!(settings.runtime.experimental_automatic_paste ?? false)} onChange={(event) => onSettings({...settings, runtime: {...settings.runtime, caret_shaping: event.target.checked}})} /> Fit dictation to surrounding text</label>
         <p>Before pasting, looks at the text beside the cursor to fix capitals, spacing and the final full stop; that text is never saved or sent to the engine.</p>
       </fieldset>

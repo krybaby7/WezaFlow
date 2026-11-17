@@ -3,7 +3,7 @@
 //! and is dropped once the dictation has been shaped.
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    mpsc, Arc, Mutex,
+    mpsc,
 };
 use std::time::{Duration, Instant};
 
@@ -37,13 +37,6 @@ impl CaretContext {
             selection,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum CaretRead {
-    Unknown,
-    Password,
-    Known(CaretContext),
 }
 
 const DAY_AND_MONTH_NAMES: [&str; 19] = [
@@ -123,7 +116,7 @@ fn lowercase_first_letter(text: &str) -> String {
 
 /// Returns the text to paste. `None` is an unknown context: only the trailing
 /// space that separates back-to-back dictations is added.
-pub(super) fn shape(text: &str, context: Option<&CaretContext>) -> String {
+pub(super) fn shape(text: &str, context: Option<&CaretContext>, preserve_initial_case: bool) -> String {
     if text.trim().is_empty() {
         return text.to_string();
     }
@@ -131,7 +124,7 @@ pub(super) fn shape(text: &str, context: Option<&CaretContext>) -> String {
     let Some(context) = context else {
         return if ends_in_space { text.to_string() } else { format!("{text} ") };
     };
-    let mut shaped = if continues_sentence(&context.before) {
+    let mut shaped = if !preserve_initial_case && continues_sentence(&context.before) {
         lowercase_first_letter(text)
     } else {
         text.to_string()
@@ -154,102 +147,134 @@ pub(super) fn shape(text: &str, context: Option<&CaretContext>) -> String {
     shaped
 }
 
-/// Reads the caret context of the focused element. Implementations may block
-/// inside another process; callers bound them with `CaretReads`.
-pub(super) trait CaretReader: Send + Sync + 'static {
-    fn read(&self, target_pid: u32) -> CaretRead;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum EditorIdentity {
+    NativeEdit,
+    Automation { provider_pid: u32, runtime_id: Vec<i32> },
 }
 
-struct PendingRead {
-    session_id: String,
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum FocusRead {
+    Unknown,
+    Sensitive,
+    Changed,
+    Editor(EditorIdentity, Option<CaretContext>),
+}
+
+static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+pub(super) struct FocusProbe {
     deadline: Instant,
-    result: mpsc::Receiver<CaretRead>,
+    result: mpsc::Receiver<(Instant, FocusRead)>,
 }
 
-/// One caret read per session, each on its own thread so a read stuck in
-/// another process never delays a later dictation.
-pub(super) struct CaretReads {
-    reader: Arc<dyn CaretReader>,
-    budget: Duration,
-    pending: Mutex<Option<PendingRead>>,
-    in_flight: Arc<AtomicUsize>,
-}
-
-impl Default for CaretReads {
-    fn default() -> Self {
-        Self::new(Arc::new(SystemCaretReader), CARET_READ_BUDGET)
-    }
-}
-
-impl CaretReads {
-    pub fn new(reader: Arc<dyn CaretReader>, budget: Duration) -> Self {
-        Self { reader, budget, pending: Mutex::new(None), in_flight: Arc::new(AtomicUsize::new(0)) }
-    }
-
-    /// Starts reading for `session_id`, replacing any earlier read.
-    pub fn start(&self, session_id: &str, target_pid: u32) {
+impl FocusProbe {
+    /// A slow provider cannot hold up the dispatcher or create unlimited workers.
+    pub fn start(budget: Duration, read: impl FnOnce() -> FocusRead + Send + 'static) -> Self {
         let (sender, result) = mpsc::channel();
-        let read = PendingRead { session_id: session_id.into(), deadline: Instant::now() + self.budget, result };
-        if let Ok(mut pending) = self.pending.lock() {
-            *pending = Some(read);
-        }
-        if self.in_flight.fetch_add(1, Ordering::SeqCst) >= MAX_STUCK_READS {
-            self.in_flight.fetch_sub(1, Ordering::SeqCst);
-            return; // Dropping the sender makes the read unknown.
-        }
-        let reader = Arc::clone(&self.reader);
-        let in_flight = Arc::clone(&self.in_flight);
-        let spawned = std::thread::Builder::new().name("caret-read".into()).spawn(move || {
-            let read = reader.read(target_pid);
-            in_flight.fetch_sub(1, Ordering::SeqCst);
-            let _ = sender.send(read);
-        });
-        if spawned.is_err() {
-            self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-
-    /// Waits only for what is left of the budget. A read that belongs to
-    /// another session is never returned.
-    pub fn collect(&self, session_id: &str) -> CaretRead {
-        let read = {
-            let Ok(mut pending) = self.pending.lock() else { return CaretRead::Unknown };
-            if pending.as_ref().map(|p| p.session_id.as_str()) != Some(session_id) {
-                return CaretRead::Unknown;
+        let deadline = Instant::now() + budget;
+        if IN_FLIGHT.fetch_add(1, Ordering::SeqCst) < MAX_STUCK_READS {
+            if std::thread::Builder::new().name("focused-editor".into()).spawn(move || {
+                struct Slot;
+                impl Drop for Slot {
+                    fn drop(&mut self) { IN_FLIGHT.fetch_sub(1, Ordering::SeqCst); }
+                }
+                let _slot = Slot;
+                let observation = read();
+                let _ = sender.send((Instant::now(), observation));
+            }).is_err() {
+                IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
             }
-            pending.take()
-        };
-        let Some(read) = read else { return CaretRead::Unknown };
-        read.result
-            .recv_timeout(read.deadline.saturating_duration_since(Instant::now()))
-            .unwrap_or(CaretRead::Unknown)
+        } else {
+            IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        }
+        Self { deadline, result }
     }
-}
 
-struct SystemCaretReader;
-
-#[cfg(windows)]
-impl CaretReader for SystemCaretReader {
-    fn read(&self, target_pid: u32) -> CaretRead {
-        unsafe { uia_read(target_pid) }.unwrap_or(CaretRead::Unknown)
-    }
-}
-
-#[cfg(not(windows))]
-impl CaretReader for SystemCaretReader {
-    fn read(&self, _target_pid: u32) -> CaretRead {
-        CaretRead::Unknown
+    pub fn collect(&self) -> FocusRead {
+        match self.result.recv_timeout(self.deadline.saturating_duration_since(Instant::now())) {
+            Ok((completed, observation)) if completed <= self.deadline => observation,
+            _ => FocusRead::Unknown,
+        }
     }
 }
 
 #[cfg(windows)]
-unsafe fn uia_read(target_pid: u32) -> windows::core::Result<CaretRead> {
+pub(super) fn read_focus(include_context: bool) -> FocusRead {
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+    unsafe {
+        if CoInitializeEx(None, COINIT_MULTITHREADED).is_err() {
+            return FocusRead::Unknown;
+        }
+        let result = uia_read(include_context).unwrap_or(FocusRead::Unknown);
+        CoUninitialize();
+        result
+    }
+}
+
+#[cfg(windows)]
+unsafe fn explicit_bool(mut value: windows::Win32::System::Variant::VARIANT) -> Option<bool> {
+    use windows::Win32::{
+        Foundation::{VARIANT_FALSE, VARIANT_TRUE},
+        System::Variant::{VariantClear, VT_BOOL},
+    };
+    let raw = &value.Anonymous.Anonymous;
+    let result = if raw.vt != VT_BOOL {
+        None
+    } else {
+        match raw.Anonymous.boolVal {
+            VARIANT_FALSE => Some(false),
+            VARIANT_TRUE => Some(true),
+            _ => None,
+        }
+    };
+    let _ = VariantClear(&mut value);
+    result
+}
+
+#[cfg(windows)]
+unsafe fn runtime_id(
+    element: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+) -> Option<Vec<i32>> {
+    use windows::Win32::System::Ole::{
+        SafeArrayDestroy, SafeArrayGetDim, SafeArrayGetElement, SafeArrayGetElemsize,
+        SafeArrayGetLBound, SafeArrayGetUBound,
+    };
+    let array = element.GetRuntimeId().ok()?;
+    if array.is_null() {
+        return None;
+    }
+    let id = (|| {
+        if SafeArrayGetDim(array) != 1 || SafeArrayGetElemsize(array) != 4 {
+            return None;
+        }
+        let lo = SafeArrayGetLBound(array, 1).ok()?;
+        let hi = SafeArrayGetUBound(array, 1).ok()?;
+        if !(0..64).contains(&hi.checked_sub(lo)?) {
+            return None;
+        }
+        (lo..=hi).map(|index| {
+            let mut entry = 0i32;
+            SafeArrayGetElement(array, &index, (&mut entry as *mut i32).cast()).ok()?;
+            Some(entry)
+        }).collect()
+    })();
+    let _ = SafeArrayDestroy(array);
+    id
+}
+
+fn writable_editor(has_edit_role: bool, has_text_edit_pattern: bool, writable: bool) -> bool {
+    writable && (has_edit_role || has_text_edit_pattern)
+}
+
+#[cfg(windows)]
+unsafe fn uia_read(include_context: bool) -> windows::core::Result<FocusRead> {
     use windows::core::Interface;
     use windows::Win32::{
-        System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED},
+        System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER},
         UI::Accessibility::*,
     };
-    let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     let timeout = CARET_READ_BUDGET.as_millis() as u32;
     let automation: IUIAutomation =
         match CoCreateInstance::<_, IUIAutomation2>(&CUIAutomation8, None, CLSCTX_INPROC_SERVER) {
@@ -261,18 +286,56 @@ unsafe fn uia_read(target_pid: u32) -> windows::core::Result<CaretRead> {
             Err(_) => CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?,
         };
     let element = automation.GetFocusedElement()?;
-    if element.CurrentProcessId()? as u32 != target_pid {
-        return Ok(CaretRead::Unknown);
+    match explicit_bool(element.GetCurrentPropertyValueEx(UIA_IsPasswordPropertyId, true)?) {
+        Some(true) => return Ok(FocusRead::Sensitive),
+        Some(false) => (),
+        None => return Ok(FocusRead::Unknown),
     }
-    if element.CurrentIsPassword()?.as_bool() {
-        return Ok(CaretRead::Password);
+    if !element.CurrentHasKeyboardFocus()?.as_bool() || !element.CurrentIsEnabled()?.as_bool() {
+        return Ok(FocusRead::Unknown);
     }
-    let Ok(pattern) = element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId) else {
-        return Ok(CaretRead::Unknown);
+    let control = element.CurrentControlType()?;
+    let edit_role = control == UIA_EditControlTypeId || control == UIA_DocumentControlTypeId;
+    let text_edit = element.GetCurrentPatternAs::<IUIAutomationTextEditPattern>(UIA_TextEditPatternId).ok();
+    let provider_pid = element.CurrentProcessId()? as u32;
+    let Some(id) = runtime_id(&element).filter(|_| provider_pid != 0) else {
+        return Ok(FocusRead::Unknown);
     };
+    let text = element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId).ok()
+        .or_else(|| text_edit.as_ref().map(|pattern| (**pattern).clone()));
+    let writable = match element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) {
+        Ok(value) => !value.CurrentIsReadOnly()?.as_bool(),
+        Err(_) => text.as_ref().and_then(|pattern| pattern.DocumentRange().ok())
+            .and_then(|range| range.GetAttributeValue(UIA_IsReadOnlyAttributeId).ok())
+            .and_then(|value| explicit_bool(value)) == Some(false),
+    };
+    if !writable_editor(edit_role, text_edit.is_some(), writable) {
+        return Ok(FocusRead::Unknown);
+    }
+    let context = if include_context {
+        text.as_ref().and_then(|pattern| read_context(pattern).ok()).flatten()
+    } else {
+        None
+    };
+    let current = automation.GetFocusedElement()?;
+    if current.CurrentProcessId()? as u32 != provider_pid || runtime_id(&current).as_ref() != Some(&id) {
+        return Ok(FocusRead::Changed);
+    }
+    match explicit_bool(current.GetCurrentPropertyValueEx(UIA_IsPasswordPropertyId, true)?) {
+        Some(false) => Ok(FocusRead::Editor(EditorIdentity::Automation { provider_pid, runtime_id: id }, context)),
+        Some(true) => Ok(FocusRead::Sensitive),
+        None => Ok(FocusRead::Unknown),
+    }
+}
+
+#[cfg(windows)]
+unsafe fn read_context(
+    pattern: &windows::Win32::UI::Accessibility::IUIAutomationTextPattern,
+) -> windows::core::Result<Option<CaretContext>> {
+    use windows::Win32::UI::Accessibility::*;
     let ranges = pattern.GetSelection()?;
     if ranges.Length()? < 1 {
-        return Ok(CaretRead::Unknown);
+        return Ok(None);
     }
     let selected = ranges.GetElement(0)?;
     let selection = selected.CompareEndpoints(TextPatternRangeEndpoint_Start, &selected, TextPatternRangeEndpoint_End)? != 0;
@@ -284,7 +347,7 @@ unsafe fn uia_read(target_pid: u32) -> windows::core::Result<CaretRead> {
     after.MoveEndpointByUnit(TextPatternRangeEndpoint_End, TextUnit_Character, AFTER_CHARS as i32)?;
     let before = before.GetText((BEFORE_CHARS * 2) as i32)?.to_string();
     let after = after.GetText((AFTER_CHARS * 2) as i32)?.to_string();
-    Ok(CaretRead::Known(CaretContext::from_raw(&before, &after, selection)))
+    Ok(Some(CaretContext::from_raw(&before, &after, selection)))
 }
 
 #[cfg(test)]
@@ -293,6 +356,23 @@ mod tests {
 
     fn known(before: &str, after: &str) -> CaretContext {
         CaretContext::from_raw(before, after, false)
+    }
+
+    #[test]
+    fn editable_role_or_text_edit_pattern_needs_explicit_writability() {
+        assert!(writable_editor(true, false, true));
+        assert!(writable_editor(false, true, true));
+        assert!(!writable_editor(false, false, true));
+        assert!(!writable_editor(true, true, false));
+        assert!(!writable_editor(false, true, false));
+    }
+
+    #[test]
+    fn preserves_approved_initial_capitals_without_changing_spacing_or_punctuation() {
+        let context = known("we use", "today");
+        assert_eq!(shape("Wezza.", Some(&context), true), " Wezza ");
+        assert_eq!(shape("Wispr Flow.", Some(&context), true), " Wispr Flow ");
+        assert_eq!(shape("Simple.", Some(&context), false), " simple ");
     }
 
     #[test]
@@ -349,7 +429,7 @@ mod tests {
         ];
         for (text, context, expected, name) in cases {
             let context = context.map(|(before, after)| known(before, after));
-            assert_eq!(shape(text, context.as_ref()), *expected, "{name}");
+            assert_eq!(shape(text, context.as_ref(), false), *expected, "{name}");
         }
     }
 
@@ -363,79 +443,34 @@ mod tests {
         assert_eq!(CaretContext::from_raw("a\r\n", "", false).before, "");
     }
 
-    struct FakeReader {
-        delay: Duration,
-        answer: CaretRead,
-        calls: AtomicUsize,
-        stuck_first: bool,
-    }
-    impl FakeReader {
-        fn new(delay_ms: u64, answer: CaretRead) -> Arc<Self> {
-            Arc::new(Self { delay: Duration::from_millis(delay_ms), answer, calls: AtomicUsize::new(0), stuck_first: false })
-        }
-    }
-    impl CaretReader for FakeReader {
-        fn read(&self, target_pid: u32) -> CaretRead {
-            let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
-            if self.stuck_first && first {
-                std::thread::sleep(Duration::from_secs(5));
-            } else {
-                std::thread::sleep(self.delay);
-            }
-            if target_pid == 0 { CaretRead::Unknown } else { self.answer.clone() }
-        }
-    }
-    fn answer() -> CaretRead {
-        CaretRead::Known(known("we should", ""))
+    #[test]
+    fn timely_metadata_remains_available_for_its_capture() {
+        let probe = FocusProbe::start(Duration::from_millis(500), || FocusRead::Sensitive);
+        assert_eq!(probe.collect(), FocusRead::Sensitive);
+        assert_eq!(probe.collect(), FocusRead::Unknown);
     }
 
     #[test]
-    fn read_in_time_is_returned_for_its_session() {
-        let reads = CaretReads::new(FakeReader::new(0, answer()), Duration::from_millis(500));
-        reads.start("one", 42);
-        assert_eq!(reads.collect("one"), answer());
-        assert_eq!(reads.collect("one"), CaretRead::Unknown);
+    fn late_answer_is_discarded_even_if_it_arrives_before_collection() {
+        let (finished_send, finished) = mpsc::channel();
+        let probe = FocusProbe::start(Duration::ZERO, move || {
+            let _ = finished_send.send(());
+            FocusRead::Sensitive
+        });
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(probe.collect(), FocusRead::Unknown);
     }
 
     #[test]
-    fn late_read_is_unknown_within_the_budget() {
-        let reads = CaretReads::new(FakeReader::new(400, answer()), Duration::from_millis(40));
-        reads.start("one", 42);
-        let started = Instant::now();
-        assert_eq!(reads.collect("one"), CaretRead::Unknown);
-        assert!(started.elapsed() < Duration::from_millis(300));
-    }
-
-    #[test]
-    fn failed_read_and_password_are_reported() {
-        let reads = CaretReads::new(FakeReader::new(0, answer()), Duration::from_millis(500));
-        reads.start("one", 0); // fake failure
-        assert_eq!(reads.collect("one"), CaretRead::Unknown);
-        let reads = CaretReads::new(FakeReader::new(0, CaretRead::Password), Duration::from_millis(500));
-        reads.start("one", 42);
-        assert_eq!(reads.collect("one"), CaretRead::Password);
-    }
-
-    #[test]
-    fn read_for_another_session_is_never_applied() {
-        let reads = CaretReads::new(FakeReader::new(0, answer()), Duration::from_millis(500));
-        assert_eq!(reads.collect("one"), CaretRead::Unknown);
-        reads.start("old", 42);
-        assert_eq!(reads.collect("new"), CaretRead::Unknown);
-        reads.start("newer", 42);
-        assert_eq!(reads.collect("old"), CaretRead::Unknown);
-        assert_eq!(reads.collect("newer"), answer());
-    }
-
-    #[test]
-    fn stuck_read_does_not_delay_the_next_dictation() {
-        let reader = Arc::new(FakeReader { delay: Duration::ZERO, answer: answer(), calls: AtomicUsize::new(0), stuck_first: true });
-        let reads = CaretReads::new(reader, Duration::from_millis(50));
-        reads.start("one", 42);
-        assert_eq!(reads.collect("one"), CaretRead::Unknown);
-        reads.start("two", 42);
-        let started = Instant::now();
-        assert_eq!(reads.collect("two"), answer());
-        assert!(started.elapsed() < Duration::from_millis(200));
+    fn blocked_provider_does_not_delay_a_later_probe() {
+        let (unblock, blocked) = mpsc::channel();
+        let probe = FocusProbe::start(Duration::from_millis(20), move || {
+            let _ = blocked.recv();
+            FocusRead::Sensitive
+        });
+        assert_eq!(probe.collect(), FocusRead::Unknown);
+        let next = FocusProbe::start(Duration::from_millis(500), || FocusRead::Sensitive);
+        assert_eq!(next.collect(), FocusRead::Sensitive);
+        let _ = unblock.send(());
     }
 }

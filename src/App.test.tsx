@@ -256,29 +256,29 @@ describe("App", () => {
     expect(writeText).toHaveBeenCalledWith("Hello.");
   });
 
-  it("ends a sent paste quietly and points an undelivered result to Ctrl+V", async () => {
+  it("distinguishes an unverified paste request from a recovered result", async () => {
     tauriMocks.getDesktopWindowLabel.mockReturnValue("recording-bar");
     render(<App client={fakeClient()} />);
     const handler = tauriMocks.listenToRecordingBarState.mock.calls[0]?.[0] as unknown as (value: {state:string;mode:string;message?:string|null;delivery?:string|null}) => void;
-    await act(async () => handler({state:"ready",mode:"dictation",message:null,delivery:"pasted"}));
-    expect(screen.getByText("Pasted")).toBeInTheDocument();
-    expect(screen.queryByText("Ready to copy")).not.toBeInTheDocument();
-    expect(screen.getByRole("status",{name:"Recording feedback"}).querySelector("small")).toBeNull();
-    await act(async () => handler({state:"ready",mode:"dictation",message:"Press Ctrl+V to paste it.",delivery:"clipboard"}));
-    expect(screen.getByText("Copied to clipboard")).toBeInTheDocument();
-    expect(screen.getByText("Press Ctrl+V to paste it.")).toBeInTheDocument();
-    await act(async () => handler({state:"recording",mode:"dictation",delivery:"pasted"}));
+    await act(async () => handler({state:"ready",mode:"dictation",message:"Delivery is unverified.",delivery:"requested"}));
+    expect(screen.getByText("Paste requested")).toBeInTheDocument();
+    expect(screen.getByText("Delivery is unverified.")).toBeInTheDocument();
+    expect(screen.queryByText("Pasted")).not.toBeInTheDocument();
+    await act(async () => handler({state:"ready",mode:"dictation",message:"The focused field changed. Copy the result from Wezza.",delivery:"recovery"}));
+    expect(screen.getByText("Ready to copy")).toBeInTheDocument();
+    expect(screen.getByText("The focused field changed. Copy the result from Wezza.")).toBeInTheDocument();
+    await act(async () => handler({state:"recording",mode:"dictation",delivery:"requested"}));
     expect(screen.getByText("Listening")).toBeInTheDocument();
     await act(async () => handler({state:"cancelled",mode:"dictation",message:"Hold the key to dictate."}));
     expect(screen.getByText("Hold the key to dictate.")).toBeInTheDocument();
   });
 
-  it("describes clipboard restore and fallback for automatic paste", async () => {
+  it("describes clipboard preservation and manual recovery", async () => {
     render(<App client={fakeClient()} />);
     await userEvent.click(await screen.findByRole("tab", { name: "Dictation" }));
-    expect(await screen.findByText(/puts back what was on your clipboard/)).toBeInTheDocument();
-    expect(screen.queryByText(/leaves the result on your clipboard/)).not.toBeInTheDocument();
+    expect(await screen.findByText(/tries to restore your previous clipboard/)).toHaveTextContent(/use Copy result in Wezza/);
   });
+
 
   it("renders acknowledged processing, recovery and cancellation states after release", async () => {
     tauriMocks.getDesktopWindowLabel.mockReturnValue("recording-bar");
