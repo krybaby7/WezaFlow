@@ -9,14 +9,27 @@ import shutil
 ORIGINAL = Path('C:/Users/adami/projects/Hobby/Tier 1/WEZZA')
 SOURCE = Path(__file__).resolve().parents[1]
 MARKER = 'wezza-personal-trial-v1'
+MODEL_BYTES = 5629109120
 
 
-def assemble(exe=None):
-    target = ORIGINAL / 'artifacts/Wezza-Personal-Trial'
-    marker = target / '.package-owner'
-    if target.exists() and not (marker.is_file() and marker.read_text() == MARKER):
-        raise RuntimeError(f'Refusing to overwrite unrecognized directory: {target}')
-    target.mkdir(parents=True, exist_ok=True)
+def assemble(exe=None, *, output_dir=None):
+    default_target = ORIGINAL / 'artifacts/Wezza-Personal-Trial'
+    if output_dir is None:
+        target = default_target
+        marker = target / '.package-owner'
+        if target.exists() and not (marker.is_file() and marker.read_text() == MARKER):
+            raise RuntimeError(f'Refusing to overwrite unrecognized directory: {target}')
+        target.mkdir(parents=True, exist_ok=True)
+    else:
+        supplied = Path(output_dir)
+        if supplied.is_symlink():
+            raise FileExistsError(f'Output directory already exists: {supplied}')
+        target = supplied.resolve()
+        live = default_target.resolve()
+        if target == live or live in target.parents:
+            raise ValueError(f'Output directory must be outside the deployed trial: {live}')
+        target.mkdir(parents=True, exist_ok=False)
+        marker = target / '.package-owner'
     marker.write_text(MARKER)
     project = target / 'project'
     project.mkdir(exist_ok=True)
@@ -49,7 +62,7 @@ def assemble(exe=None):
         return dict(path=relative, bytes=size, sha256=digest)
 
     model = link(model_dir / 'qwen3.5-9b-q4_k_m.gguf', 'qwen3.5-9b-q4_k_m.gguf',
-                 5629109120, '02d45dc1cf451ba2475ac33b301c2dd8f985abe4c182ce04a1f2f5bf0260278d')
+                 MODEL_BYTES, '02d45dc1cf451ba2475ac33b301c2dd8f985abe4c182ce04a1f2f5bf0260278d')
     template_file = model_dir / 'chat_template.no-thinking.jinja'
     template = link(template_file, template_file.name, template_file.stat().st_size,
                     hashlib.sha256(template_file.read_bytes()).hexdigest())
@@ -73,7 +86,7 @@ def assemble(exe=None):
   reap_timeout_seconds: 5
 local_editor:
   enabled: true
-  manifest_path: {manifest_path.as_posix()}
+  manifest_path: {json.dumps(manifest_path.as_posix(), ensure_ascii=False)}
   startup_timeout: 120
   request_timeout: 15
   idle_timeout: 60
@@ -110,4 +123,6 @@ runtime:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--exe', help='Final built desktop executable to copy as Wezza.exe')
-    assemble(parser.parse_args().exe)
+    parser.add_argument('--output-dir', type=Path, help='Fresh directory for a separate trial package')
+    args = parser.parse_args()
+    assemble(args.exe, output_dir=args.output_dir)
