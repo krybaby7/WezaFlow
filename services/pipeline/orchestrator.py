@@ -5,10 +5,11 @@ from collections.abc import Callable
 from typing import Any
 
 from services.pipeline.models import AppContext, PipelineResult
-from services.vocabulary.aliases import substitute_aliases
+from services.vocabulary.aliases import ApprovedAlias, starts_with_canonical_name, substitute_aliases
 
 
 ASR_PROMPT_LIMIT = 2000
+FORMATTER_ALIAS_HINT_LIMIT = 20
 
 
 class PipelineOrchestrator:
@@ -53,21 +54,26 @@ class PipelineOrchestrator:
             return None
 
         phase_started = time.perf_counter()
-        formatter_hints = self._formatter_hints(vocabulary_hints)
+        list_aliases = getattr(self.vocabulary_store, "list_aliases", None)
+        aliases = list_aliases() if callable(list_aliases) else []
+        canonical_names = list(dict.fromkeys(alias["canonical"] for alias in aliases))
+        formatter_hints = self._formatter_hints(vocabulary_hints, canonical_names)
         asr_result = self.transcriber.transcribe(
             filtered_audio,
             language=language,
-            initial_prompt=self._asr_initial_prompt(vocabulary_hints),
+            initial_prompt=self._asr_initial_prompt(vocabulary_hints, canonical_names),
         )
         asr_ms = self._elapsed_ms(phase_started)
         if not asr_result.text.strip():
             return None
 
         phase_started = time.perf_counter()
-        polished_text = self._expand_or_format(
+        polished_text, preserve_initial_case = self._expand_or_format(
             asr_result.text,
             app_context,
             vocabulary_hints=formatter_hints,
+            aliases=aliases,
+            canonical_names=canonical_names,
         )
         format_ms = self._elapsed_ms(phase_started)
 
@@ -77,6 +83,9 @@ class PipelineOrchestrator:
         inject_ms = self._elapsed_ms(phase_started)
         total_ms = self._elapsed_ms(started)
 
+        diagnostics = self._diagnostics()
+        if preserve_initial_case:
+            diagnostics["preserve_initial_case"] = True
         return PipelineResult(
             raw_transcript=asr_result.text,
             polished_text=polished_text,
@@ -90,7 +99,7 @@ class PipelineOrchestrator:
                 "inject_ms": inject_ms,
                 "total_ms": total_ms,
             },
-            diagnostics=self._diagnostics(),
+            diagnostics=diagnostics,
         )
 
     def process_command(
@@ -168,25 +177,27 @@ class PipelineOrchestrator:
         app_context: AppContext,
         *,
         vocabulary_hints: list[str] | None,
-    ) -> str:
+        aliases: list[ApprovedAlias],
+        canonical_names: list[str],
+    ) -> tuple[str, bool]:
         if self.snippets is not None:
             expansion = self.snippets.expand(raw_text)
             if expansion:
-                return expansion
+                return expansion, False
         format_result = self.formatter.format(
             raw_text,
             app_context,
             vocabulary_hints=vocabulary_hints,
         )
         if format_result.model == "raw-recovery":
-            return raw_text
-        list_aliases = getattr(self.vocabulary_store, "list_aliases", None)
-        if callable(list_aliases):
-            return substitute_aliases(format_result.text, list_aliases())
-        return format_result.text
+            return raw_text, False
+        polished_text = substitute_aliases(format_result.text, aliases)
+        return polished_text, starts_with_canonical_name(polished_text, canonical_names)
 
-    def _formatter_hints(self, explicit_hints: list[str] | None) -> list[str] | None:
-        hints: list[str] = []
+    def _formatter_hints(
+        self, explicit_hints: list[str] | None, canonical_names: list[str]
+    ) -> list[str] | None:
+        hints = _dedupe_non_empty(canonical_names)[:FORMATTER_ALIAS_HINT_LIMIT]
         formatter_hints = getattr(self.vocabulary_store, "formatter_hints", None)
         if callable(formatter_hints):
             hints.extend(str(hint) for hint in formatter_hints() if str(hint).strip())
@@ -194,12 +205,14 @@ class PipelineOrchestrator:
             hints.extend(explicit_hints)
         return _dedupe_non_empty(hints) or None
 
-    def _asr_initial_prompt(self, explicit_hints: list[str] | None) -> str | None:
+    def _asr_initial_prompt(
+        self, explicit_hints: list[str] | None, canonical_names: list[str] | None = None
+    ) -> str | None:
         hints: list[str] = []
         asr_hints = getattr(self.vocabulary_store, "asr_hints", None)
         asr_terms = getattr(self.vocabulary_store, "asr_terms", None)
         if callable(asr_terms):
-            hints.extend(asr_terms())
+            hints.extend(asr_terms(canonical_names=canonical_names))
         elif callable(asr_hints):
             store_hints = str(asr_hints()).strip()
             if store_hints:

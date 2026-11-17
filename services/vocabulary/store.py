@@ -210,8 +210,14 @@ class VocabularyStore:
     def asr_hints(self, vocabulary_limit: int = 20, correction_limit: int = 20) -> str:
         return ", ".join(self.asr_terms(vocabulary_limit, correction_limit))
 
-    def asr_terms(self, vocabulary_limit: int = 20, correction_limit: int = 20) -> list[str]:
-        candidates = [alias["canonical"] for alias in self.list_aliases()]
+    def asr_terms(
+        self, vocabulary_limit: int = 20, correction_limit: int = 20, *,
+        canonical_names: list[str] | None = None,
+    ) -> list[str]:
+        candidates = (
+            [alias["canonical"] for alias in self.list_aliases()]
+            if canonical_names is None else list(canonical_names)
+        )
         candidates.extend(self._list_display_vocabulary(vocabulary_limit))
         candidates.extend(str(row["corrected"]) for row in self.list_correction_pairs(limit=correction_limit))
         terms: list[str] = []

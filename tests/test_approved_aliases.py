@@ -1,8 +1,10 @@
+import json
 import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -134,3 +136,48 @@ class ApprovedAliasTests(unittest.TestCase):
         transcript = "x " * 900
         result = self.pipeline(store, transcript).process_audio([0.2])
         self.assertEqual(result.polished_text, "polished: " + transcript)
+
+    def test_approved_initial_case_is_per_result_and_requires_a_complete_phrase(self):
+        store = VocabularyStore(self.db)
+        store.save_alias("WESA", "Wezza")
+        store.save_alias("whisper flow", "Wispr Flow")
+        store.record_correction("words", "Words")
+
+        class IdentityBackend:
+            def edit(self, *, system_prompt, user_payload):
+                payload = json.loads(user_payload)
+                return json.dumps({"edited_text": payload["raw"]})
+
+        formatter = LocalCleanupFormatter(editor=ConstrainedEditor(IdentityBackend()))
+        for transcript, expected in (
+            ("WESA, send this", True),
+            ("Wezza", True),
+            ("Wispr Flow.", True),
+            ("whisper flow is open", True),
+            ("WezzaFlow is open", False),
+            ("Wispr Flower", False),
+            ("Wezza.io", False),
+            ("Wispr Flow.io", False),
+            ("Ordinary text about Wezza", False),
+        ):
+            with self.subTest(transcript=transcript):
+                result = self.pipeline(store, transcript, formatter).process_audio([0.2])
+                self.assertEqual(result.diagnostics.get("preserve_initial_case", False), expected)
+
+        self.assertIsNone(self.pipeline(store, "  ", formatter).process_audio([0.2]))
+        raw = self.pipeline(store, "Wezza", LocalCleanupFormatter()).process_audio([0.2])
+        self.assertFalse(raw.diagnostics.get("preserve_initial_case", False))
+        store.delete_alias("WESA")
+        result = self.pipeline(store, "Wezza", formatter).process_audio([0.2])
+        self.assertFalse(result.diagnostics.get("preserve_initial_case", False))
+
+    def test_approved_canonical_names_reach_formatter_from_one_alias_read(self):
+        store = VocabularyStore(self.db)
+        store.add_word("LocalFlow")
+        store.record_correction("lf", "LocalFlow")
+        store.save_alias("WESA", "Wezza")
+        formatter = FakeFormatter()
+        with patch.object(store, "list_aliases", wraps=store.list_aliases) as list_aliases:
+            self.pipeline(store, "WESA", formatter).process_audio([0.2], vocabulary_hints=["Explicit"])
+        list_aliases.assert_called_once_with()
+        self.assertEqual(formatter.calls[0][2], ["Wezza", "LocalFlow", "lf -> LocalFlow", "Explicit"])

@@ -73,3 +73,26 @@ def substitute_aliases(text: str, aliases: list[ApprovedAlias]) -> str:
         cursor = protected.end()
     pieces.append(replace_in_prose(text[cursor:]))
     return "".join(pieces) if result_length <= _MAX_POSTPASS_CHARS else text
+
+
+def starts_with_canonical_name(text: str, canonical_names: list[str]) -> bool:
+    text = text.lstrip()
+    for name in canonical_names:
+        if not text.startswith(name):
+            continue
+        end = len(name)
+        if end == len(text):
+            return True
+        next_character = text[end]
+        if (
+            next_character.isalnum()
+            or next_character == "_"
+            or unicodedata.category(next_character).startswith("M")
+        ):
+            continue
+        # Check whether the last word continues into an identifier, URL, or email.
+        last_word = name.rsplit(maxsplit=1)[-1]
+        protected = _PROTECTED_TEXT.match(text, end - len(last_word))
+        if protected is None or protected.end() <= end:
+            return True
+    return False
