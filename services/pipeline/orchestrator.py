@@ -189,7 +189,7 @@ class PipelineOrchestrator:
             app_context,
             vocabulary_hints=vocabulary_hints,
         )
-        if format_result.model == "raw-recovery":
+        if getattr(format_result, "model", None) == "raw-recovery":
             return raw_text, False
         polished_text = substitute_aliases(format_result.text, aliases)
         return polished_text, starts_with_canonical_name(polished_text, canonical_names)

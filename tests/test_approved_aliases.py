@@ -13,7 +13,7 @@ from services.pipeline.orchestrator import PipelineOrchestrator
 from services.runtime.api import create_app
 from services.runtime.local_editor import LocalCleanupFormatter
 from services.vocabulary.store import VocabularyStore
-from test_pipeline import FakeFormatter, FakeInjector, FakeTranscriber, FakeVAD, fake_context
+from tests.test_pipeline import FakeFormatter, FakeInjector, FakeTranscriber, FakeVAD, fake_context
 
 
 class ApprovedAliasTests(unittest.TestCase):

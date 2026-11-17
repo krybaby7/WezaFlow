@@ -38,6 +38,7 @@ class ScaffoldContractTests(unittest.TestCase):
                 "app_profiles",
                 "snippets",
                 "transcription_history",
+                "approved_aliases",
                 "corrections",
             },
             tables,
