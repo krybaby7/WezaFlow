@@ -304,7 +304,7 @@ def create_app(
 
     @app.get("/vocabulary/terms")
     def get_vocabulary_terms(limit: int | None = None) -> dict[str, Any]:
-        return {"status": "ok", "terms": _vocabulary_store(state).list_vocabulary(limit=limit)}
+        return {"status": "ok", "terms": _vocabulary_store(state).list_vocabulary(limit=limit, include_display=True)}
 
     @app.post("/vocabulary/terms")
     def post_vocabulary_term(payload: dict[str, Any]) -> dict[str, Any]:
@@ -313,13 +313,35 @@ def create_app(
             raise HTTPException(status_code=400, detail="word is required")
         store = _vocabulary_store(state)
         store.add_word(word)
-        return {"status": "ok", "terms": store.list_vocabulary()}
+        return {"status": "ok", "terms": store.list_vocabulary(include_display=True)}
 
     @app.delete("/vocabulary/terms/{word:path}")
     def delete_vocabulary_term(word: str) -> dict[str, Any]:
         store = _vocabulary_store(state)
         deleted = store.delete_word(word)
-        return {"status": "ok", "deleted": deleted, "terms": store.list_vocabulary()}
+        return {"status": "ok", "deleted": deleted, "terms": store.list_vocabulary(include_display=True)}
+
+    @app.get("/vocabulary/aliases")
+    def get_vocabulary_aliases() -> dict[str, Any]:
+        return {"status": "ok", "aliases": _vocabulary_store(state).list_aliases()}
+
+    @app.post("/vocabulary/aliases")
+    def save_vocabulary_alias(payload: dict[str, Any]) -> dict[str, Any]:
+        store = _vocabulary_store(state)
+        try:
+            store.save_alias(payload.get("spoken"), payload.get("canonical"))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"status": "ok", "aliases": store.list_aliases()}
+
+    @app.delete("/vocabulary/aliases")
+    def delete_vocabulary_alias(spoken: str) -> dict[str, Any]:
+        store = _vocabulary_store(state)
+        try:
+            deleted = store.delete_alias(spoken)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"status": "ok", "deleted": deleted, "aliases": store.list_aliases()}
 
     @app.get("/vocabulary/corrections")
     def get_corrections(limit: int | None = None) -> dict[str, Any]:

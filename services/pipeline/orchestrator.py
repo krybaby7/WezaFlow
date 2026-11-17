@@ -5,6 +5,10 @@ from collections.abc import Callable
 from typing import Any
 
 from services.pipeline.models import AppContext, PipelineResult
+from services.vocabulary.aliases import substitute_aliases
+
+
+ASR_PROMPT_LIMIT = 2000
 
 
 class PipelineOrchestrator:
@@ -174,6 +178,11 @@ class PipelineOrchestrator:
             app_context,
             vocabulary_hints=vocabulary_hints,
         )
+        if format_result.model == "raw-recovery":
+            return raw_text
+        list_aliases = getattr(self.vocabulary_store, "list_aliases", None)
+        if callable(list_aliases):
+            return substitute_aliases(format_result.text, list_aliases())
         return format_result.text
 
     def _formatter_hints(self, explicit_hints: list[str] | None) -> list[str] | None:
@@ -188,14 +197,23 @@ class PipelineOrchestrator:
     def _asr_initial_prompt(self, explicit_hints: list[str] | None) -> str | None:
         hints: list[str] = []
         asr_hints = getattr(self.vocabulary_store, "asr_hints", None)
-        if callable(asr_hints):
+        asr_terms = getattr(self.vocabulary_store, "asr_terms", None)
+        if callable(asr_terms):
+            hints.extend(asr_terms())
+        elif callable(asr_hints):
             store_hints = str(asr_hints()).strip()
             if store_hints:
                 hints.extend(part.strip() for part in store_hints.split(","))
         if explicit_hints:
             hints.extend(explicit_hints)
-        deduped = _dedupe_non_empty(hints)
-        return ", ".join(deduped) if deduped else None
+        bounded: list[str] = []
+        used = 0
+        for hint in _dedupe_non_empty(hints):
+            cost = len(hint) + (2 if bounded else 0)
+            if used + cost <= ASR_PROMPT_LIMIT:
+                bounded.append(hint)
+                used += cost
+        return ", ".join(bounded) if bounded else None
 
     @staticmethod
     def _elapsed_ms(started: float) -> int:

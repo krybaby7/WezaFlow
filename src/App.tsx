@@ -18,6 +18,7 @@ import {
 } from "lucide-react";
 
 import {
+  type ApprovedAlias,
   type CorrectionPair,
   type DependencyStatus,
   type LearningSuggestion,
@@ -58,6 +59,9 @@ export type RuntimeClient = {
   listVocabulary(): Promise<VocabularyTerm[]>;
   addVocabulary(word: string): Promise<VocabularyTerm[]>;
   deleteVocabulary(word: string): Promise<VocabularyTerm[]>;
+  listAliases(): Promise<ApprovedAlias[]>;
+  saveAlias(spoken: string, canonical: string): Promise<ApprovedAlias[]>;
+  deleteAlias(spoken: string): Promise<ApprovedAlias[]>;
   listCorrections(): Promise<CorrectionPair[]>;
   addCorrection(original: string, corrected: string): Promise<CorrectionPair[]>;
   deleteCorrection(original: string, corrected: string): Promise<CorrectionPair[]>;
@@ -499,6 +503,7 @@ function SettingsApp({ client = DEFAULT_CLIENT }: { client?: RuntimeClient }) {
         )}
         {tab === "vocabulary" && (
           <VocabularyPanel
+            aliasClient={client}
             vocabulary={vocabulary}
             corrections={corrections}
             suggestions={learningSuggestions}
@@ -1115,7 +1120,106 @@ function DictationPanel({
   );
 }
 
+const ALIAS_EXAMPLES: ApprovedAlias[] = [
+  { spoken: "WESA", canonical: "Wezza" },
+  { spoken: "whisper flow", canonical: "Wispr Flow" }
+];
+
+type AliasClient = Pick<RuntimeClient, "listAliases" | "saveAlias" | "deleteAlias">;
+
+function ApprovedAliases({ client }: { client: AliasClient }) {
+  const [aliases, setAliases] = useState<ApprovedAlias[] | null>(null);
+  const [spoken, setSpoken] = useState("");
+  const [canonical, setCanonical] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void client.listAliases().then((entries) => {
+      if (!cancelled) setAliases(entries);
+    }).catch((err: unknown) => {
+      if (!cancelled) setError(err instanceof Error ? err.message : "Could not load aliases");
+    });
+    return () => { cancelled = true; };
+  }, [client]);
+
+  function resetForm() {
+    setSpoken("");
+    setCanonical("");
+    setEditing(false);
+  }
+
+  async function updateAliases(update: () => Promise<ApprovedAlias[]>, clearForm = false) {
+    setBusy(true);
+    setError(null);
+    try {
+      setAliases(await update());
+      if (clearForm) resetForm();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not update aliases");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="section" aria-label="Approved aliases">
+      <h2>Approved aliases</h2>
+      <p>Use these spellings in cleaned dictation.</p>
+      {error && <p role="alert">{error}</p>}
+      {aliases && (
+        <>
+          <form className="row" onSubmit={(event) => {
+            event.preventDefault();
+            void updateAliases(() => client.saveAlias(spoken, canonical), true);
+          }}>
+            <input aria-label="Heard as" placeholder="Heard as" maxLength={128}
+              value={spoken} onChange={(event) => setSpoken(event.target.value)} readOnly={editing} disabled={busy} />
+            <input aria-label="Canonical spelling" placeholder="Canonical spelling" maxLength={128}
+              value={canonical} onChange={(event) => setCanonical(event.target.value)} disabled={busy} />
+            <button type="submit" disabled={busy || !spoken.trim() || !canonical.trim()}>
+              {editing ? "Save alias" : "Approve alias"}
+            </button>
+            {editing && <button type="button" onClick={resetForm} disabled={busy}>Cancel edit</button>}
+          </form>
+          <ul className="list">
+            {aliases.map((alias) => (
+              <li key={alias.spoken}>
+                <span dir="auto">{alias.spoken} → {alias.canonical}</span>
+                <div className="row">
+                  <button type="button" disabled={busy} aria-label={`Edit ${alias.spoken}`} onClick={() => {
+                    setSpoken(alias.spoken);
+                    setCanonical(alias.canonical);
+                    setEditing(true);
+                  }}>Edit</button>
+                  <button type="button" disabled={busy} aria-label={`Remove ${alias.spoken}`}
+                    onClick={() => void updateAliases(() => client.deleteAlias(alias.spoken), spoken === alias.spoken)}>
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+          <div className="row">
+            {ALIAS_EXAMPLES.filter((example) =>
+              !aliases.some((alias) => alias.spoken.toLowerCase() === example.spoken.toLowerCase())
+            ).map(({ spoken: heard, canonical: spelling }) => (
+              <button type="button" disabled={busy} key={heard}
+                onClick={() => void updateAliases(() => client.saveAlias(heard, spelling))}>
+                Approve {heard} → {spelling}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
 function VocabularyPanel(props: {
+  aliasClient: AliasClient;
   vocabulary: VocabularyTerm[];
   corrections: CorrectionPair[];
   suggestions: LearningSuggestion[];
@@ -1148,7 +1252,7 @@ function VocabularyPanel(props: {
         <ul className="list">
           {props.vocabulary.map((term) => (
             <li key={term.word}>
-              <span>{term.word}</span>
+              <span>{term.display_word ?? term.word}</span>
               <button type="button" onClick={() => props.onDeleteWord(term.word)}>
                 <Square size={14} />
               </button>
@@ -1156,6 +1260,7 @@ function VocabularyPanel(props: {
           ))}
         </ul>
       </div>
+      <ApprovedAliases client={props.aliasClient} />
       <div className="section">
         <h2>Corrections</h2>
         <input

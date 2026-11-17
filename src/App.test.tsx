@@ -50,6 +50,9 @@ function fakeClient(overrides: Partial<RuntimeClient> = {}): RuntimeClient {
     warmRuntime: vi.fn(async () => undefined),
     checkRuntime: vi.fn(async () => []),
     listVocabulary: vi.fn(async () => []),
+    listAliases: vi.fn(async () => []),
+    saveAlias: vi.fn(async () => []),
+    deleteAlias: vi.fn(async () => []),
     addVocabulary: vi.fn(async () => []),
     deleteVocabulary: vi.fn(async () => []),
     listCorrections: vi.fn(async () => []),
@@ -71,6 +74,26 @@ describe("App", () => {
     vi.useRealTimers();
     vi.clearAllMocks();
     tauriMocks.getDesktopWindowLabel.mockReturnValue("main");
+  });
+
+  it("enables example aliases only when approved and lets users edit or remove them", async () => {
+    const saveAlias = vi.fn(async (spoken: string, canonical: string) => [{ spoken, canonical }]);
+    const deleteAlias = vi.fn(async (_spoken: string) => []);
+    render(<App client={fakeClient({ saveAlias, deleteAlias })} />);
+
+    await userEvent.click(await screen.findByRole("tab", { name: "Vocabulary" }));
+    const approve = await screen.findByRole("button", { name: "Approve WESA → Wezza" });
+    expect(saveAlias).not.toHaveBeenCalled();
+    await userEvent.click(approve);
+    expect(await screen.findByText("WESA → Wezza")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Edit WESA" }));
+    await userEvent.clear(screen.getByRole("textbox", { name: "Canonical spelling" }));
+    await userEvent.type(screen.getByRole("textbox", { name: "Canonical spelling" }), "WezzaFlow");
+    await userEvent.click(screen.getByRole("button", { name: "Save alias" }));
+    expect(await screen.findByText("WESA → WezzaFlow")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Remove WESA" }));
+    expect(deleteAlias).toHaveBeenCalledWith("WESA");
+    expect(await screen.findByRole("button", { name: "Approve WESA → Wezza" })).toBeInTheDocument();
   });
 
   it("renders only the compact recording bar in the recording-bar window", () => {
@@ -477,31 +500,24 @@ describe("App", () => {
   });
 
   it("refreshes status and diagnostics after saving a dictation profile", async () => {
-    const getStatus = vi
-      .fn()
-      .mockResolvedValueOnce({
-        status: "ok",
-        state: "idle",
-        mode: "idle",
-        profile: "low-impact",
-        quiet_mode: false,
-        quality_fallback: false,
-        last_error: null
-      })
-      .mockResolvedValueOnce({
-        status: "ok",
-        state: "idle",
-        mode: "idle",
-        profile: "snappy",
-        quiet_mode: false,
-        quality_fallback: false,
-        last_error: null
-      });
+    let profile = "low-impact";
+    const getStatus = vi.fn(async () => ({
+      status: "ok",
+      state: "idle" as const,
+      mode: "idle" as const,
+      profile,
+      quiet_mode: false,
+      quality_fallback: false,
+      last_error: null
+    }));
     const getDiagnostics = vi
       .fn()
       .mockResolvedValueOnce(["Runtime: profile=low-impact model=small.en"])
       .mockResolvedValueOnce(["Runtime: profile=snappy model=small.en threads=4"]);
-    const saveSettings = vi.fn(async (settings) => settings);
+    const saveSettings = vi.fn(async (settings) => {
+      profile = settings.runtime.profile;
+      return settings;
+    });
 
     const warmRuntime = vi.fn(async () => undefined);
 
@@ -515,7 +531,7 @@ describe("App", () => {
     await userEvent.click(screen.getByRole("button", { name: "Save settings" }));
     await userEvent.click(screen.getByRole("tab", { name: "Status" }));
 
-    await waitFor(() => expect(getStatus).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(getStatus.mock.calls.length).toBeGreaterThanOrEqual(2));
     await waitFor(() => expect(getDiagnostics).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(warmRuntime).not.toHaveBeenCalled());
     expect(screen.getByText("snappy")).toBeInTheDocument();

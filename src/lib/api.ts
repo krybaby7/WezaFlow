@@ -97,7 +97,13 @@ export type LocalEditorSettings = {
 
 export type VocabularyTerm = {
   word: string;
+  display_word?: string;
   frequency: number;
+};
+
+export type ApprovedAlias = {
+  spoken: string;
+  canonical: string;
 };
 
 export type CorrectionPair = {
@@ -198,6 +204,28 @@ export class RuntimeApiClient {
       { method: "DELETE" }
     );
     return payload.terms;
+  }
+
+  async listAliases(): Promise<ApprovedAlias[]> {
+    const payload = await this.request<{ aliases: ApprovedAlias[] }>("/vocabulary/aliases");
+    return payload.aliases;
+  }
+
+  async saveAlias(spoken: string, canonical: string): Promise<ApprovedAlias[]> {
+    const payload = await this.request<{ aliases: ApprovedAlias[] }>("/vocabulary/aliases", {
+      method: "POST",
+      body: JSON.stringify({ spoken, canonical })
+    });
+    return payload.aliases;
+  }
+
+  async deleteAlias(spoken: string): Promise<ApprovedAlias[]> {
+    const params = new URLSearchParams({ spoken });
+    const payload = await this.request<{ aliases: ApprovedAlias[] }>(
+      `/vocabulary/aliases?${params}`,
+      { method: "DELETE" }
+    );
+    return payload.aliases;
   }
 
   async listCorrections(): Promise<CorrectionPair[]> {

@@ -35,3 +35,9 @@ CREATE TABLE IF NOT EXISTS corrections (
   corrected TEXT NOT NULL,
   count INTEGER DEFAULT 1
 );
+
+CREATE TABLE IF NOT EXISTS approved_aliases (
+  spoken_key TEXT PRIMARY KEY,
+  spoken TEXT NOT NULL,
+  canonical TEXT NOT NULL
+);

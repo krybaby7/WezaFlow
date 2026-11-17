@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from pathlib import Path
+
+from services.vocabulary.aliases import ApprovedAlias, MAX_ALIAS_LENGTH, MAX_APPROVED_ALIASES
 
 
 class VocabularyStore:
@@ -36,6 +39,47 @@ class VocabularyStore:
         finally:
             connection.close()
 
+    def list_aliases(self) -> list[ApprovedAlias]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT spoken, canonical FROM approved_aliases ORDER BY spoken_key"
+            ).fetchall()
+        return [{"spoken": spoken, "canonical": canonical} for spoken, canonical in rows]
+
+    def save_alias(self, spoken: object, canonical: object) -> None:
+        spoken, canonical = self._alias_text(spoken), self._alias_text(canonical)
+        key = spoken.casefold()
+        with closing(self._connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            exists = connection.execute(
+                "SELECT 1 FROM approved_aliases WHERE spoken_key = ?", (key,)
+            ).fetchone()
+            count = connection.execute("SELECT count(*) FROM approved_aliases").fetchone()[0]
+            if not exists and count >= MAX_APPROVED_ALIASES:
+                raise ValueError(f"At most {MAX_APPROVED_ALIASES} approved aliases are supported")
+            connection.execute(
+                """
+                INSERT INTO approved_aliases (spoken_key, spoken, canonical) VALUES (?, ?, ?)
+                ON CONFLICT(spoken_key) DO UPDATE SET spoken = excluded.spoken, canonical = excluded.canonical
+                """,
+                (key, spoken, canonical),
+            )
+
+    def delete_alias(self, spoken: str) -> bool:
+        key = self._alias_text(spoken).casefold()
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute("DELETE FROM approved_aliases WHERE spoken_key = ?", (key,))
+            return cursor.rowcount > 0
+
+    @staticmethod
+    def _alias_text(value: object) -> str:
+        if not isinstance(value, str) or any(not char.isprintable() for char in value):
+            raise ValueError("Alias phrases must be printable text")
+        text = value.strip()
+        if not 1 <= len(text) <= MAX_ALIAS_LENGTH or not any(char.isalnum() for char in text):
+            raise ValueError(f"Alias phrases must contain a letter or number and be at most {MAX_ALIAS_LENGTH} characters")
+        return text
+
     def record_correction(self, original: str, corrected: str) -> None:
         original = original.strip()
         corrected = corrected.strip()
@@ -58,8 +102,8 @@ class VocabularyStore:
         finally:
             connection.close()
 
-    def list_vocabulary(self, limit: int | None = None) -> list[dict[str, int | str]]:
-        sql = "SELECT word, frequency FROM vocabulary ORDER BY frequency DESC, word ASC"
+    def list_vocabulary(self, limit: int | None = None, *, include_display: bool = False) -> list[dict[str, int | str]]:
+        sql = "SELECT word, frequency, COALESCE(display_word, word) FROM vocabulary ORDER BY frequency DESC, word ASC"
         params: tuple[int, ...] = ()
         if limit is not None:
             sql += " LIMIT ?"
@@ -69,7 +113,10 @@ class VocabularyStore:
             rows = connection.execute(sql, params).fetchall()
         finally:
             connection.close()
-        return [{"word": row[0], "frequency": row[1]} for row in rows]
+        if include_display:
+            return [{"word": word, "frequency": frequency, "display_word": display}
+                    for word, frequency, display in rows]
+        return [{"word": word, "frequency": frequency} for word, frequency, _ in rows]
 
     def delete_word(self, word: str) -> bool:
         normalized = self._normalize(word)
@@ -161,20 +208,26 @@ class VocabularyStore:
         return hints
 
     def asr_hints(self, vocabulary_limit: int = 20, correction_limit: int = 20) -> str:
-        terms = self._list_display_vocabulary(vocabulary_limit)
-        seen = {term.casefold() for term in terms}
-        for row in self.list_correction_pairs(limit=correction_limit):
-            corrected = str(row["corrected"])
+        return ", ".join(self.asr_terms(vocabulary_limit, correction_limit))
+
+    def asr_terms(self, vocabulary_limit: int = 20, correction_limit: int = 20) -> list[str]:
+        candidates = [alias["canonical"] for alias in self.list_aliases()]
+        candidates.extend(self._list_display_vocabulary(vocabulary_limit))
+        candidates.extend(str(row["corrected"]) for row in self.list_correction_pairs(limit=correction_limit))
+        terms: list[str] = []
+        seen: set[str] = set()
+        for corrected in candidates:
             if corrected.casefold() not in seen:
                 terms.append(corrected)
                 seen.add(corrected.casefold())
-        return ", ".join(terms)
+        return terms
 
     def _init_schema(self) -> None:
         schema_path = Path(__file__).resolve().parents[2] / "db" / "schema.sql"
         connection = self._connect()
         try:
             connection.executescript(schema_path.read_text(encoding="utf-8"))
+            connection.execute("BEGIN IMMEDIATE")
             columns = {
                 row[1]
                 for row in connection.execute("PRAGMA table_info(vocabulary)").fetchall()
