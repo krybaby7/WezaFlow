@@ -8,7 +8,9 @@ def fixture_worker(connection, config, identity, generation, runtime_hash):
     from pathlib import Path
     mode_path = Path(config.snapshot)/'fixture-mode'
     mode = mode_path.read_text() if mode_path.exists() else 'normal'
-    receive(connection)
+    start = receive(connection)
+    if mode in ('hung_start', 'die_start'):
+        (Path(config.snapshot) / 'fixture-start').write_text(start['op'])
     if mode == 'startup_error':
         connection.send_bytes(encode({'op':'error','generation':generation,'identity':identity,'code':'startup_failed'}))
         return
@@ -26,7 +28,7 @@ def fixture_worker(connection, config, identity, generation, runtime_hash):
         time.sleep(120)
     while True:
         request = receive(connection)
-        (Path(config.snapshot)/'fixture-decode').write_text('decode')
+        (Path(config.snapshot)/'fixture-decode').write_text(request['op'])
         if mode in ('decode_error','unsafe_error'):
             connection.send_bytes(encode({'op':'error','generation':generation,'identity':identity,'request':request['request'],'code':'decode_failed' if mode == 'decode_error' else 'unsafe user transcript'}))
             return
