@@ -1585,20 +1585,25 @@ fn maybe_compatibility_paste(
         let caret_shaping = commands.caret_shaping;
         // Taking this token makes every later observation inert, even if HTTP
         // reservation/completion fails or returns an idempotent replay.
-        let Some(target) = commands.paste_target.take() else {
-            eprintln!("Paste decision: NoCapturedTarget");
-            return Some(PasteFeedback::recovery("No focused field was captured at key-down. Copy the result from Wezza."));
-        };
-        if target.session_id != id || reply["capture_id"] != target.capture_id
-            || reply["result_session_id"].as_str() != Some(id)
-            || reply["result_generation"] != reply["session_generation"] {
-            eprintln!("Paste decision: CaptureMismatch");
-            return Some(PasteFeedback::recovery("The result did not match the captured field. Copy the result from Wezza."));
+        match commands.paste_target.take() {
+            None => Err(("NoCapturedTarget", "No focused field was captured at key-down. Copy the result from Wezza.")),
+            Some(target) if target.session_id != id || reply["capture_id"] != target.capture_id
+                || reply["result_session_id"].as_str() != Some(id)
+                || reply["result_generation"] != reply["session_generation"] => {
+                Err(("CaptureMismatch", "The result did not match the captured field. Copy the result from Wezza."))
+            }
+            Some(target) => Ok((target, caret_shaping)),
         }
-        (target, caret_shaping)
     };
-    let (target, caret_shaping) = target;
+    let (target, caret_shaping) = match target {
+        Ok(target) => target,
+        Err((code, message)) => {
+            record_paste_decision(format_args!("{code}"));
+            return Some(PasteFeedback::recovery(message));
+        }
+    };
     let Some(text) = reply["result"]["polished_text"].as_str().filter(|s| !s.trim().is_empty()) else {
+        record_paste_decision(format_args!("InvalidText"));
         return Some(PasteFeedback::recovery("There was no usable text for automatic paste. Check the result in Wezza."));
     };
     let transaction = new_uuid().ok()?;
@@ -1608,9 +1613,11 @@ fn maybe_compatibility_paste(
     let reserved = tauri::async_runtime::block_on(authenticated_request(
         app, identity, "POST", "/runtime/commit/reserve", Some(payload.clone())));
     let Ok(reserved) = reserved else {
+        record_paste_decision(format_args!("ReservationUnavailable"));
         return Some(PasteFeedback::recovery("Paste authorization was unavailable. Copy the result from Wezza. Restart Wezza if it stays busy."));
     };
     if reserved["reservation_decision"] != "reserved" || reserved["write_authorized"] != true {
+        record_paste_decision(format_args!("ReservationDenied"));
         return Some(PasteFeedback::recovery("Paste was not authorized. Copy the result from Wezza."));
     }
     use windows_paste::{PasteReason, PasteResult};
@@ -1638,12 +1645,26 @@ fn maybe_compatibility_paste(
         }
         Ok(windows_paste::paste(&target, shaped.as_deref().unwrap_or(text), plan))
     })().unwrap_or_else(PasteResult::skipped);
-    eprintln!("Paste decision: {:?}, clipboard: {:?}", paste_result.reason, paste_result.clipboard);
+    record_paste_decision(format_args!("{:?} {:?}", paste_result.reason, paste_result.clipboard));
     payload["outcome"] = serde_json::json!(paste_result.reason.outcome());
     let completed = tauri::async_runtime::block_on(authenticated_request(
         app, identity, "POST", "/runtime/commit/complete", Some(payload)));
     let recorded = completed.as_ref().is_ok_and(|r| r["accepted"] == true);
+    if !recorded {
+        record_paste_decision(format_args!("CompletionUnverified"));
+    }
     Some(paste_feedback(&paste_result, recorded))
+}
+
+// Callers supply only static outcome codes and enums, never dictation or window data.
+fn record_paste_decision(outcome: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let path = project_root().join("artifacts").join("logs").join("desktop-paste.log");
+    let Ok(mut log) = OpenOptions::new().create(true).append(true).open(path) else { return; };
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+    let _ = writeln!(log, "{stamp} {outcome}");
 }
 
 fn paste_feedback(result: &windows_paste::PasteResult, recorded: bool) -> PasteFeedback {

@@ -243,6 +243,87 @@ pub(super) fn restore_allowed(recorded: u32, current: u32) -> bool {
     recorded != 0 && recorded == current
 }
 
+/// Identifies one staged write independently of Windows' clipboard sequence,
+/// which can advance during CloseClipboard as it synthesizes text formats.
+#[derive(Clone, Copy)]
+struct ClipboardWrite {
+    owner: usize,
+    format: u32,
+    nonce: [u8; 16],
+}
+
+impl ClipboardWrite {
+    fn confirm(&self, owner: usize, nonce: Option<[u8; 16]>, sequence: u32) -> Result<u32, PasteReason> {
+        if owner != self.owner || nonce != Some(self.nonce) {
+            return Err(PasteReason::ClipboardChanged);
+        }
+        if sequence == 0 {
+            return Err(PasteReason::ClipboardBusy);
+        }
+        Ok(sequence)
+    }
+
+    #[cfg(windows)]
+    fn new(owner: usize) -> Option<Self> {
+        use windows::Win32::System::Com::CoCreateGuid;
+        let format = unsafe { clipboard_write_format()? };
+        let nonce = unsafe { CoCreateGuid().ok()?.to_u128().to_le_bytes() };
+        Some(Self { owner, format, nonce })
+    }
+
+    /// Caller has the clipboard open. Check the HWND before asking Windows
+    /// for the eagerly staged marker and never inspect any foreign content.
+    #[cfg(windows)]
+    unsafe fn confirm_open(&self) -> Result<u32, PasteReason> {
+        use windows_sys::Win32::System::{DataExchange::*, Memory::*};
+        let owner = GetClipboardOwner() as usize;
+        if owner != self.owner {
+            return Err(PasteReason::ClipboardChanged);
+        }
+        let handle = GetClipboardData(self.format);
+        let nonce = if !handle.is_null() && GlobalSize(handle) >= self.nonce.len() {
+            let ptr = GlobalLock(handle).cast::<[u8; 16]>();
+            if ptr.is_null() {
+                None
+            } else {
+                let value = ptr.read_unaligned();
+                GlobalUnlock(handle);
+                Some(value)
+            }
+        } else {
+            None
+        };
+        self.confirm(owner, nonce, GetClipboardSequenceNumber())
+    }
+
+    #[cfg(windows)]
+    unsafe fn confirm_clipboard_write(&self) -> Result<u32, PasteReason> {
+        use windows_sys::Win32::System::DataExchange::CloseClipboard;
+        if !open_clipboard(self.owner) {
+            return Err(PasteReason::ClipboardBusy);
+        }
+        let confirmed = self.confirm_open();
+        CloseClipboard();
+        confirmed
+    }
+}
+
+#[cfg(windows)]
+unsafe fn clipboard_write_format() -> Option<u32> {
+    use windows_sys::Win32::System::DataExchange::RegisterClipboardFormatW;
+    let name: Vec<u16> = "WezzaFlowPasteWriteV1".encode_utf16().chain(Some(0)).collect();
+    let format = RegisterClipboardFormatW(name.as_ptr());
+    (format != 0).then_some(format)
+}
+
+fn match_restore_generation(proof: Result<u32, PasteReason>, expected: Option<u32>) -> Result<bool, PasteReason> {
+    match proof {
+        Ok(current) => Ok(expected.map_or(true, |sequence| restore_allowed(sequence, current))),
+        Err(PasteReason::ClipboardChanged) => Ok(false),
+        Err(reason) => Err(reason),
+    }
+}
+
 pub(super) struct SavedClipboard {
     formats: Vec<(u32, Vec<u8>)>,
 }
@@ -279,7 +360,7 @@ impl<T> RestoreSlot<T> {
 
 struct Restore {
     saved: SavedClipboard,
-    owner: usize,
+    write: ClipboardWrite,
 }
 
 // Held during a restore, so a new paste never snapshots a half-restored clipboard.
@@ -295,15 +376,15 @@ fn restores() -> std::sync::MutexGuard<'static, RestoreSlot<Restore>> {
 pub(super) struct ClipboardPlan {
     saved: Option<SavedClipboard>,
     sequence: u32,
-    inherited: bool,
+    inherited: Option<ClipboardWrite>,
     owner: usize,
 }
 impl Drop for ClipboardPlan {
     // A paste that never touched the clipboard leaves our previous text there,
     // so the inherited original still has to come back.
     fn drop(&mut self) {
-        if let (true, Some(saved)) = (self.inherited, self.saved.take()) {
-            schedule_restore(Restore { saved, owner: self.owner }, self.sequence);
+        if let (Some(write), Some(saved)) = (self.inherited, self.saved.take()) {
+            schedule_restore(Restore { saved, write }, self.sequence);
         }
     }
 }
@@ -314,14 +395,14 @@ pub(super) fn prepare_clipboard(owner: usize) -> ClipboardPlan {
         use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;
         let mut slot = restores();
         if let Some((sequence, restore)) = slot.take_for_paste(GetClipboardSequenceNumber()) {
-            return ClipboardPlan { saved: Some(restore.saved), sequence, inherited: true, owner };
+            return ClipboardPlan { saved: Some(restore.saved), sequence, inherited: Some(restore.write), owner };
         }
         drop(slot);
         let (saved, sequence) = bounded_snapshot(owner);
-        ClipboardPlan { saved, sequence, inherited: false, owner }
+        ClipboardPlan { saved, sequence, inherited: None, owner }
     }
     #[cfg(not(windows))]
-    { ClipboardPlan { saved: None, sequence: 0, inherited: false, owner } }
+    { ClipboardPlan { saved: None, sequence: 0, inherited: None, owner } }
 }
 
 #[cfg(windows)]
@@ -364,6 +445,7 @@ unsafe fn open_clipboard(owner: usize) -> bool {
 #[cfg(windows)]
 unsafe fn take_snapshot(owner: usize) -> (Option<SavedClipboard>, u32) {
     use windows_sys::Win32::{Foundation::{GetLastError, SetLastError}, System::{DataExchange::*, Memory::*}};
+    let Some(write_format) = clipboard_write_format() else { return (None, 0); };
     if !open_clipboard(owner) { return (None, 0); }
     let mut formats = Vec::new();
     let mut total = 0;
@@ -376,6 +458,8 @@ unsafe fn take_snapshot(owner: usize) -> (Option<SavedClipboard>, u32) {
             complete &= GetLastError() == 0;
             break;
         }
+        // The marker is a per-write proof, never a format to replay on restore.
+        if format == write_format { continue; }
         if !snapshot_format_allowed(format) { complete = false; break; }
         let handle = GetClipboardData(format);
         let size = if handle.is_null() { 0 } else { GlobalSize(handle) };
@@ -465,16 +549,17 @@ fn schedule_restore(restore: Restore, sequence: u32) {
         std::thread::sleep(RESTORE_DELAY);
         let mut slot = restores();
         let current = unsafe { windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber() };
-        if let Some(due) = slot.take_due(generation, current) {
-            if !unsafe { restore_clipboard_retry(&due.saved, due.owner, sequence) } {
-                eprintln!("Paste clipboard restore failed while the previous snapshot was owned");
-            }
+        let failed = slot.take_due(generation, current)
+            .is_some_and(|due| !unsafe { restore_clipboard_retry(&due.saved, &due.write, Some(sequence)) });
+        drop(slot);
+        if failed {
+            crate::record_paste_decision(format_args!("RestoreFailed"));
         }
     });
 }
 #[cfg(not(windows))]
 fn schedule_restore(restore: Restore, sequence: u32) {
-    let _ = (restore.saved.formats.len(), restore.owner, sequence);
+    let _ = (restore.saved.formats.len(), restore.write.owner, sequence);
 }
 
 #[cfg(windows)]
@@ -485,15 +570,15 @@ enum RestoreAttempt {
 }
 
 #[cfg(windows)]
-unsafe fn restore_clipboard_retry(saved: &SavedClipboard, owner: usize, expected: u32) -> bool {
+unsafe fn restore_clipboard_retry(saved: &SavedClipboard, write: &ClipboardWrite, expected: Option<u32>) -> bool {
     use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;
     // Retry a busy clipboard once. An incomplete restore is not retried, and
     // a sequence from a competing write is never overwritten.
     for _ in 0..2 {
-        if !restore_allowed(expected, GetClipboardSequenceNumber()) {
+        if expected.is_some_and(|seq| !restore_allowed(seq, GetClipboardSequenceNumber())) {
             return true;
         }
-        match restore_clipboard(saved, owner, expected) {
+        match restore_clipboard(saved, write, expected) {
             RestoreAttempt::Finished => return true,
             RestoreAttempt::Busy => (),
             RestoreAttempt::Failed => return false,
@@ -503,19 +588,17 @@ unsafe fn restore_clipboard_retry(saved: &SavedClipboard, owner: usize, expected
 }
 
 #[cfg(windows)]
-unsafe fn restore_clipboard(saved: &SavedClipboard, owner: usize, expected: u32) -> RestoreAttempt {
+unsafe fn restore_clipboard(saved: &SavedClipboard, write: &ClipboardWrite, expected: Option<u32>) -> RestoreAttempt {
     use windows_sys::Win32::System::DataExchange::*;
     let Some(staged) = saved_formats(saved) else { return RestoreAttempt::Failed; };
-    if !open_clipboard(owner) { return RestoreAttempt::Busy; }
+    if !open_clipboard(write.owner) { return RestoreAttempt::Busy; }
     // Re-check while holding the clipboard: a newer copy must win.
-    let result = if !restore_allowed(expected, GetClipboardSequenceNumber()) {
-        RestoreAttempt::Finished
-    } else if EmptyClipboard() == 0 {
-        RestoreAttempt::Busy
-    } else if staged.install() {
-        RestoreAttempt::Finished
-    } else {
-        RestoreAttempt::Failed
+    let result = match match_restore_generation(write.confirm_open(), expected) {
+        Ok(false) => RestoreAttempt::Finished,
+        Err(_) => RestoreAttempt::Busy,
+        Ok(true) if EmptyClipboard() == 0 => RestoreAttempt::Busy,
+        Ok(true) if staged.install() => RestoreAttempt::Finished,
+        Ok(true) => RestoreAttempt::Failed,
     };
     CloseClipboard();
     result
@@ -582,6 +665,9 @@ pub(super) fn paste(target: &Target, text: &str, mut plan: ClipboardPlan) -> Pas
         if let Err(reason) = check_native_target(target) {
             return PasteResult::skipped(reason);
         }
+        let Some(write) = ClipboardWrite::new(owner) else {
+            return PasteResult::skipped(PasteReason::ClipboardUnavailable);
+        };
         let markers = privacy_markers();
         if markers.len() != 3 {
             return PasteResult::skipped(PasteReason::ClipboardUnavailable);
@@ -590,7 +676,7 @@ pub(super) fn paste(target: &Target, text: &str, mut plan: ClipboardPlan) -> Pas
         let data: Vec<u8> = text.encode_utf16().chain(Some(0)).flat_map(u16::to_le_bytes).collect();
         // Install privacy markers first. If one fails, the text is never installed.
         let Some(payload) = Staged::new(markers.iter().map(|format| (*format, zero.as_slice()))
-            .chain(std::iter::once((CF_UNICODETEXT, data.as_slice())))) else {
+            .chain([(write.format, write.nonce.as_slice()), (CF_UNICODETEXT, data.as_slice())])) else {
             return PasteResult::skipped(PasteReason::ClipboardUnavailable);
         };
         if OpenClipboard(owner as _) == 0 {
@@ -601,6 +687,12 @@ pub(super) fn paste(target: &Target, text: &str, mut plan: ClipboardPlan) -> Pas
         if let Err(reason) = preflight {
             CloseClipboard();
             return PasteResult::skipped(reason);
+        }
+        if let Some(inherited) = &plan.inherited {
+            if let Err(reason) = inherited.confirm_open() {
+                CloseClipboard();
+                return PasteResult::skipped(reason);
+            }
         }
         let Some(saved) = plan.saved.as_ref() else {
             CloseClipboard();
@@ -628,21 +720,24 @@ pub(super) fn paste(target: &Target, text: &str, mut plan: ClipboardPlan) -> Pas
                 clipboard: if restored { ClipboardMutation::NoRecoveryIssue } else { ClipboardMutation::RestoreFailed },
             };
         }
-        let prepared = GetClipboardSequenceNumber();
         CloseClipboard();
-        let recover = |reason| {
-            let replaced = prepared != 0 && GetClipboardSequenceNumber() != prepared;
-            let restored = replaced || (prepared != 0 && restore_clipboard_retry(&saved, owner, prepared));
+        let recover = |reason, expected| {
+            let restored = restore_clipboard_retry(&saved, &write, expected);
             PasteResult {
                 reason,
                 clipboard: if restored { ClipboardMutation::NoRecoveryIssue } else { ClipboardMutation::RestoreFailed },
             }
         };
+        let prepared = match write.confirm_clipboard_write() {
+            Ok(sequence) => sequence,
+            Err(PasteReason::ClipboardChanged) => return PasteResult::skipped(PasteReason::ClipboardChanged),
+            Err(reason) => return recover(reason, None),
+        };
         if !restore_allowed(prepared, GetClipboardSequenceNumber()) {
-            return recover(PasteReason::ClipboardChanged);
+            return recover(PasteReason::ClipboardChanged, Some(prepared));
         }
         if let Err(reason) = check_native_target(target) {
-            return recover(reason);
+            return recover(reason, Some(prepared));
         }
         let mut events: [INPUT; 4] = std::mem::zeroed();
         for (event, (key, flags)) in events.iter_mut().zip([(VK_CONTROL, 0), (0x56, 0), (0x56, KEYEVENTF_KEYUP), (VK_CONTROL, KEYEVENTF_KEYUP)]) {
@@ -650,18 +745,18 @@ pub(super) fn paste(target: &Target, text: &str, mut plan: ClipboardPlan) -> Pas
             event.Anonymous.ki = KEYBDINPUT { wVk: key, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 };
         }
         if !restore_allowed(prepared, GetClipboardSequenceNumber()) {
-            return recover(PasteReason::ClipboardChanged);
+            return recover(PasteReason::ClipboardChanged, Some(prepared));
         }
         let reason = classify_send(SendInput(4, events.as_ptr(), std::mem::size_of::<INPUT>() as i32));
         if reason == PasteReason::InputRejected {
-            return recover(reason);
+            return recover(reason, Some(prepared));
         }
         if reason == PasteReason::InputPartial {
             // Release keys only. No retry, Enter or additional keydown.
             let releases = [events[2], events[3]];
             let _ = SendInput(2, releases.as_ptr(), std::mem::size_of::<INPUT>() as i32);
         }
-        schedule_restore(Restore { saved, owner }, prepared);
+        schedule_restore(Restore { saved, write }, prepared);
         PasteResult::skipped(reason)
     }
     #[cfg(not(windows))]
@@ -671,6 +766,44 @@ pub(super) fn paste(target: &Target, text: &str, mut plan: ClipboardPlan) -> Pas
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn post_close_sequence_is_bound_only_to_the_owned_nonce_and_window() {
+        let write = ClipboardWrite { owner: 7, format: 0xc001, nonce: [1; 16] };
+        let before_close = 100;
+        let after_close = 103;
+        assert!(!restore_allowed(before_close, after_close));
+        assert_eq!(write.confirm(7, Some([1; 16]), after_close), Ok(after_close));
+        assert_eq!(write.confirm(8, Some([1; 16]), after_close), Err(PasteReason::ClipboardChanged));
+        assert_eq!(write.confirm(7, Some([2; 16]), after_close), Err(PasteReason::ClipboardChanged));
+        assert_eq!(write.confirm(7, None, after_close), Err(PasteReason::ClipboardChanged));
+        assert_eq!(write.confirm(7, Some([1; 16]), 0), Err(PasteReason::ClipboardBusy));
+    }
+
+    #[test]
+    fn partial_send_retains_only_the_confirmed_generation_for_restore() {
+        let write = ClipboardWrite { owner: 7, format: 0xc001, nonce: [1; 16] };
+        let sequence = write.confirm(7, Some([1; 16]), 103).unwrap();
+        assert_eq!(classify_send(2).outcome(), "delivery_uncertain");
+        let current = write.confirm(7, Some([1; 16]), 103);
+        assert_eq!(match_restore_generation(current, Some(sequence)), Ok(true));
+        let replayed = write.confirm(7, Some([1; 16]), 104);
+        assert_eq!(match_restore_generation(replayed, Some(sequence)), Ok(false));
+        let same_app_new_copy = write.confirm(7, None, 104);
+        assert_eq!(match_restore_generation(same_app_new_copy, Some(sequence)), Ok(false));
+        let newer_wezza_paste = write.confirm(7, Some([2; 16]), 104);
+        assert_eq!(match_restore_generation(newer_wezza_paste, Some(sequence)), Ok(false));
+    }
+
+    #[test]
+    fn failed_post_close_confirmation_can_restore_only_the_current_owned_write() {
+        let write = ClipboardWrite { owner: 7, format: 0xc001, nonce: [1; 16] };
+        assert_eq!(match_restore_generation(Err(PasteReason::ClipboardBusy), None), Err(PasteReason::ClipboardBusy));
+        let untouched = write.confirm(7, Some([1; 16]), 103);
+        assert_eq!(match_restore_generation(untouched, None), Ok(true));
+        let replacement = write.confirm(8, Some([1; 16]), 104);
+        assert_eq!(match_restore_generation(replacement, None), Ok(false));
+    }
 
     #[test]
     fn stable_chromium_provider_can_differ_from_native_owner_but_distinct_fields_fail_closed() {
