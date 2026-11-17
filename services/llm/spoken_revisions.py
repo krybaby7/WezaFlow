@@ -23,14 +23,29 @@ _EN_DATE = (
     rf"(?:(?:on[ \t]+)?(?:{_EN_DAY})|today|tomorrow)"
     rf"(?:[ \t]+at[ \t]+(?:{_EN_TIME}))?"
 )
+_EN_RAW_CUE = r"actually[ \t]+make[ \t]+that|make[ \t]+that"
+_EN_RAW_QUESTION = r"(?:can|could|would)[ \t]+you[ \t]+(?:confirm|check|let[ \t]+me[ \t]+know)\b"
+_EN_RAW_END = rf"(?:(?P<question_gap>[ \t]+)(?={_EN_RAW_QUESTION})|{_END})"
+_CLOCK = r"(?:(?:[01٠١]?[0-9٠-٩]|[2٢][0-3٠-٣])(?::[0-5٠-٥][0-9٠-٩])?)"
+
 _EN_CUE = r"(?:actually(?:,?[ \t]+make[ \t]+that)?|no[ \t]+wait|I[ \t]+mean|make[ \t]+that)"
 _FR_REQUEST = r"(?:envoie|envoyez|livre|livrez|appelle|appelez|dépose|déposez)"
-_FR_DATE = r"(?:aujourd’hui|aujourd'hui|demain|lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)"
+_FR_DATE = (
+    r"(?:aujourd’hui|aujourd'hui|demain|lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)"
+    rf"(?:[ \t]+à[ \t]+(?:{_CLOCK}(?:[ \t]+heures?)?|"
+    r"(?:une|deux|trois|quatre|cinq|six|sept|huit|neuf|dix|onze|douze)[ \t]+heures?|midi|minuit))?"
+)
 _AR_REQUEST = r"(?:ابعت|ابعتي|أبعت|سلّم|سلم|كلمني|كلم|نتقابل|هنبعت)"
-_AR_DATE = r"(?:النهارده|بكرة|بكره|السبت|الأحد|الاحد|الحد|الاثنين|الإثنين|الاتنين|الثلاثاء|التلات|الأربعاء|الاربعاء|الأربع|الخميس|الجمعة)"
+_AR_DATE = (
+    r"(?:النهارده|بكرة|بكره|السبت|الأحد|الاحد|الحد|الاثنين|الإثنين|الاتنين|"
+    r"الثلاثاء|التلات|الأربعاء|الاربعاء|الأربع|الخميس|الجمعة)"
+    rf"(?:[ \t]+(?:الساعة|الساعه)[ \t]+(?:{_CLOCK}|واحدة|اتنين|تلاتة|أربعة|خمسة|ستة|"
+    r"سبعة|تمانية|تسعة|عشرة|حداشر|اتناشر)(?:[ \t]+(?:الصبح|بالليل|الضهر|ظهرًا|مساءً|صباحًا))?)?"
+)
 _NAME = r"[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ]{1,31}"
 
 _QUOTE_OR_CODE = re.compile(r'[“”«»"`]|(?<!\w)[\x27‘’]|[\x27‘’](?!\w)')
+_TIME_MARKER = re.compile(r"\b(?:at|à|الساعة|الساعه)\b", re.IGNORECASE)
 _NEGATION = re.compile(
     r"\b(?:no|not|never|neither|cannot|non|pas|jamais|"
     r"ما|مش|مات|مت|مفيش|بدون|بلاش)\b|\b(?:ما|مت)\w+ش\b",
@@ -42,22 +57,27 @@ _TERMINAL_MODIFIER = re.compile(
     re.IGNORECASE,
 )
 _CUES = re.compile(
-    rf"(?<=[.,،])[ \t]*(?:{_EN_CUE}|sorry|pardon|je[ \t]+veux[ \t]+dire|قصدي|أقصد|اقصد)\b",
+    rf"(?<=[.,،])[ \t]*(?:{_EN_CUE}|sorry|pardon|je[ \t]+veux[ \t]+dire|قصدي|أقصد|اقصد)\b|(?<!\S)(?:{_EN_RAW_CUE})\b",
     re.IGNORECASE,
 )
 
 
-def _deadline_pattern(request: str, dates: str, cue: str) -> re.Pattern:
+def _deadline_pattern(
+    request: str, dates: str, cue: str, *, separator: str = r"[.,،][ \t]+", end: str = _END,
+) -> re.Pattern:
     return re.compile(
         rf"{_START}(?P<prefix>{request}{_ARGUMENTS})[ \t]+"
-        rf"(?P<old>{dates})[.,،][ \t]+(?:{cue})"
-        rf"[,،]?[ \t]+(?P<new>{dates}){_END}",
+        rf"(?P<old>{dates}){separator}(?:{cue})"
+        rf"[,،]?[ \t]+(?P<new>{dates}){end}",
         re.IGNORECASE,
     )
 
 
 _DEADLINE_PATTERNS = (
     ("en", _deadline_pattern(_EN_REQUEST, _EN_DATE, _EN_CUE), _EN_DATE),
+    ("en", _deadline_pattern(
+        _EN_REQUEST, _EN_DATE, _EN_RAW_CUE, separator=r"[ \t]+", end=_EN_RAW_END,
+    ), _EN_DATE),
     ("fr", _deadline_pattern(_FR_REQUEST, _FR_DATE, r"pardon|je[ \t]+veux[ \t]+dire"), _FR_DATE),
     ("ar", _deadline_pattern(_AR_REQUEST, _AR_DATE, r"قصدي|أقصد|اقصد"), _AR_DATE),
 )
@@ -94,7 +114,12 @@ def resolve_spoken_revision(raw: str) -> str | None:
             continue
 
         replacement = match["new"]
+        if dates and _TIME_MARKER.search(match["old"]) and not _TIME_MARKER.search(replacement):
+            continue  # A date-only correction can leave the original time in force.
         if language == "en" and dates and re.match(rf"\b(?:{_EN_DAY})\b", replacement, re.IGNORECASE):
             replacement = "on " + replacement
-        return raw[:match.end("prefix")] + " " + replacement + raw[match.end():]
+        trailing = raw[match.end():]
+        if match.groupdict().get("question_gap"):
+            trailing = "." + match["question_gap"] + trailing
+        return raw[:match.end("prefix")] + " " + replacement + trailing
     return None
