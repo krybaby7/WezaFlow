@@ -1,53 +1,32 @@
-# WezaFlow
+# WezzaFlow
 
-WezaFlow is a local-first desktop dictation pipeline inspired by Wispr Flow.
-The implementation is organized as a Tauri desktop shell plus Python services for
-audio capture, speech recognition, context detection, LLM formatting, and text
-injection.
-
-The first implementation slice focuses on stable module boundaries:
-
-- `services/asr`: microphone capture, VAD, and Whisper transcription
-- `services/context`: active app and browser context detection
-- `services/llm`: local Ollama-based text formatting
-- `services/injection`: clipboard and keyboard text insertion
-- `services/pipeline`: shared contracts and orchestration
-- `db`: SQLite schema for vocabulary, snippets, profiles, corrections, and history
-- `scripts`: platform setup, startup, and test helpers
+WezzaFlow is a local-first desktop dictation app. The Tauri desktop shell manages recording and delivery, and an owned Python engine runs speech recognition and optional cleanup on this PC.
 
 ## Windows
 
-Run the tests with the project environment:
+Open **Launch Wezza.vbs** in `artifacts/WezzaFlow`. This is the stable entry point for the installed build. Opening it again while the same installation is running leaves the existing session alone. Use the tray icon to quit.
+
+Hold your configured dictation shortcut, speak, and release. Change the binding in **Hotkeys**. In **Status**, **Copy result** copies the final text and **Copy raw transcript** copies the original recognition. Disable **Local cleanup (experimental)** in **Dictation** for recognition-only output. The local multilingual profile supports English, French, and Arabic. Cleanup can still miss corrections or change wording, so check the raw transcript when the exact meaning matters.
+
+Use **Vocabulary → Approved aliases** to approve spellings such as **WESA → Wezza** and **whisper flow → Wispr Flow**. Saved terms can guide recognition, and approved aliases also apply to cleaned dictation. Wezza checks the focused field for automatic paste and can use supported caret context for spacing, punctuation, and capitalization. The spelling list comes from the vocabulary you save.
+
+In **Dictation**, turn on **Enable experimental automatic paste** and save to request Ctrl+V when the same writable, non-sensitive field is still focused. **Paste requested** means Windows accepted the shortcut. Check the field before retrying. If paste is skipped, use **Copy result**. **Fit dictation to surrounding text** can be toggled separately.
+
+### Windows development
+
+Run the tests and build from the checkout:
 
 ```powershell
 ./.venv/Scripts/python.exe -m unittest discover -s tests -v
-```
-
-Build the Windows Tauri release with:
-
-```powershell
+npm test
 npm run tauri -- build
 ```
 
-For development, run `npm run tauri -- dev`. The desktop shell starts and owns
-its authenticated local Python engine. `scripts/start_services.ps1` launches an
-existing release executable; rebuild it after source changes. Do not start a
-separate Python API before opening the desktop app.
+Use `npm run tauri -- dev` for development, or `./scripts/start_services.ps1 -DevelopmentRelease` to launch the built checkout executable. Without the switch, the script opens the installed launcher. The desktop owns its local engine.
 
-The local trilingual rebuild currently returns recoverable text with an explicit
-**Copy result** action. Automatic insertion, command editing, speculative
-processing, background prewarming, and the legacy CLI capture path are unavailable
-while the new lifecycle and insertion adapters are qualified. Existing CPU
-profiles are English-only. The experimental **Local multilingual** profile uses
-an explicit local model folder and an owned inference process with configurable
-idle unload; it preserves raw text until local grammar editing is connected.
-Saving checks paths, while first dictation checks actual model readiness. The
-profile requires a complete faster-whisper snapshot (weights, configuration,
-tokenizer, vocabulary and preprocessor); an optional verified GPU runtime manifest
-supplies DLLs to the child process without changing system PATH. No models are
-downloaded during dictation. Multilingual quality and power remain unqualified.
-See [implementation progress](docs/implementation-progress.md)
-and [speech collection instructions](docs/dictation-corpus-collection.md).
+On this PC, `scripts/assemble_personal_trial.py --exe <path>` assembles the canonical package if no installation exists. Use `--output-dir <fresh-path>` to stage a separate build. The installed package keeps its own settings, database, logs, and WebView profile.
+
+See the [implementation progress](docs/implementation-progress.md) and [speech collection instructions](docs/dictation-corpus-collection.md).
 
 ## macOS test build
 
@@ -70,7 +49,7 @@ npm run tauri -- build
 ```
 
 On first use, macOS may prompt for Microphone and Accessibility permissions.
-Grant Accessibility to the terminal during dev runs, or to WezaFlow when running
+Grant Accessibility to the terminal during dev runs, or to WezzaFlow when running
 the built app. The GitHub workflow in `.github/workflows/build-macos.yml` can
 produce a downloadable unsigned macOS test artifact from GitHub Actions. See
 `docs/macos-test-build.md` for current limits.

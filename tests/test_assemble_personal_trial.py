@@ -14,7 +14,7 @@ class PersonalTrialAssemblyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             original, source = root / "original", root / "source"
-            live = original / "artifacts" / "Wezza-Personal-Trial"
+            live = original / "artifacts" / "WezzaFlow"
             live.mkdir(parents=True)
             (live / ".package-owner").write_text(assembly.MARKER, encoding="utf-8")
             live_state = live / "live-state.txt"
@@ -68,3 +68,25 @@ class PersonalTrialAssemblyTests(unittest.TestCase):
             settings = load_settings(candidate / "project" / "config" / "settings.yaml")
             self.assertEqual(Path(settings["local_editor"]["manifest_path"]),
                              candidate / "assets" / "local-editor-manifest.json")
+
+    def test_default_refuses_to_mutate_existing_canonical_install(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "artifacts" / "WezzaFlow"
+            config = target / "project" / "config"
+            config.mkdir(parents=True)
+            settings = config / "settings.yaml"
+            settings.write_bytes(b"personal settings")
+            db = target / "project" / "db" / "localflow.db"
+            db.parent.mkdir()
+            db.write_bytes(b"personal vocabulary")
+            executable = target / "Wezza.exe"
+            executable.write_bytes(b"deployed executable")
+            (target / ".package-owner").write_text(assembly.MARKER, encoding="utf-8")
+
+            with patch.object(assembly, "ORIGINAL", root):
+                with self.assertRaises(FileExistsError):
+                    assembly.assemble()
+            self.assertEqual(settings.read_bytes(), b"personal settings")
+            self.assertEqual(db.read_bytes(), b"personal vocabulary")
+            self.assertEqual(executable.read_bytes(), b"deployed executable")

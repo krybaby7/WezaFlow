@@ -13,10 +13,14 @@ MODEL_BYTES = 5629109120
 
 
 def assemble(exe=None, *, output_dir=None):
-    default_target = ORIGINAL / 'artifacts/Wezza-Personal-Trial'
+    default_target = ORIGINAL / 'artifacts/WezzaFlow'
     if output_dir is None:
         target = default_target
         marker = target / '.package-owner'
+        if target.resolve() != target.absolute() or (target / 'Wezza.exe').exists():
+            raise FileExistsError(
+                f'WezzaFlow is already installed at {target}. Use --output-dir to stage a separate package.'
+            )
         if target.exists() and not (marker.is_file() and marker.read_text() == MARKER):
             raise RuntimeError(f'Refusing to overwrite unrecognized directory: {target}')
         target.mkdir(parents=True, exist_ok=True)
