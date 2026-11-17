@@ -74,8 +74,11 @@ _NEGATION = re.compile(
     r"ما|مش|مات|مت|مفيش|بدون|بلاش)\b|\b(?:ما|مت)\w+ش\b",
     re.IGNORECASE,
 )
+_EXISTING_DATE_PREPOSITION = re.compile(r"\b(?:for|about|around)$", re.IGNORECASE)
+_WEEKDAY_WITH_ON = re.compile(rf"(?:on[ \t]+)?(?=(?:{_EN_DAY})\b)", re.IGNORECASE)
+_SENTENCE_BOUNDARY = re.compile(r"[.!?؟](?=\s|\Z)")
 _TERMINAL_MODIFIER = re.compile(
-    r"\b(?:by|until|before|after|from|between|since|and|or|avant|après|jusqu|et|ou|"
+    r"\b(?:by|until|before|after|from|between|since|during|through|at|of|with|in|to|on|and|or|avant|après|jusqu|et|ou|"
     r"قبل|بعد|من|لحد|بين|أو|و)$",
     re.IGNORECASE,
 )
@@ -120,6 +123,15 @@ _RECIPIENT = re.compile(
 )
 
 
+def _needs_arabic_transliteration(text: str) -> bool:
+    for sentence in _SENTENCE_BOUNDARY.split(text):
+        letter_scripts = [unicodedata.name(char, "") for char in sentence if char.isalpha()]
+        if letter_scripts and "LATIN" in letter_scripts[0]:
+            if any("ARABIC" in name for name in letter_scripts):
+                return True
+    return False
+
+
 def resolve_spoken_revision(raw: str) -> str | None:
     """Replace a supported span while keeping identical text on both sides."""
     if not isinstance(raw, str) or len(raw) > 2_000 or _QUOTE_OR_CODE.search(raw):
@@ -162,10 +174,16 @@ def resolve_spoken_revision(raw: str) -> str | None:
                 weekday = _AR_WEEKDAYS[arabic_weekday["weekday"]]
                 day_word = "yom " if arabic_weekday["day_word"] else ""
                 replacement = day_word + weekday + replacement[arabic_weekday.end():]
-            elif re.match(rf"\b(?:{_EN_DAY})\b", replacement, re.IGNORECASE):
-                replacement = "on " + replacement
+            elif (weekday_start := _WEEKDAY_WITH_ON.match(replacement)) is not None:
+                if _EXISTING_DATE_PREPOSITION.search(prefix):
+                    replacement = replacement[weekday_start.end():]
+                elif weekday_start.end() == 0:
+                    replacement = "on " + replacement
         trailing = raw[match.end():]
         if match.groupdict().get("question_gap"):
             trailing = "." + match["question_gap"] + trailing
-        return raw[:match.end("prefix")] + " " + replacement + trailing
+        preceding = raw[:match.start()]
+        if _needs_arabic_transliteration(preceding) or _needs_arabic_transliteration(trailing):
+            continue
+        return preceding + prefix + " " + replacement + trailing
     return None
